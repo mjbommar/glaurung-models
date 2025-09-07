@@ -1,0 +1,11 @@
+# Tokenizer repo ignores (paths relative to tokenizers/tokenizer-001/)
+
+# Rust build outputs
+bbpe/target/
+
+# Generated artifacts
+tokenizer.json
+
+# Local references and experiments not for source control
+reference/
+old/

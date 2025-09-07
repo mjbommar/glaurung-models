@@ -1,0 +1,20 @@
+[package]
+name = "bbpe"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+walkdir = "2"
+rand = "0.8"
+
+# Use the local reference of tokenizers for compatibility
+tokenizers = { path = "../reference/tokenizers/tokenizers" }
+
+[profile.release]
+codegen-units = 1
+lto = true
+
