@@ -1,0 +1,148 @@
+{
+  "extraction_config": {
+    "output_directory": "binaries",
+    "temp_directory": "temp_extraction",
+    "log_level": "INFO",
+    "max_concurrent_extractions": 4,
+    "cleanup_temp": true
+  },
+  "targets": [
+    {
+      "image": "alpine:3.19",
+      "label": "alpine3.19",
+      "description": "Alpine Linux 3.19 - minimal security-focused",
+      "platforms": ["linux/amd64", "linux/arm64", "linux/arm/v7"],
+      "paths": [
+        "/usr/bin/**/*",
+        "/bin/**/*", 
+        "/sbin/**/*",
+        "/usr/sbin/**/*",
+        "/usr/local/bin/**/*",
+        "/usr/local/sbin/**/*"
+      ],
+      "include_patterns": ["*"],
+      "exclude_patterns": ["*.txt", "*.conf", "*.md", "*.1", "*.8"]
+    },
+    {
+      "image": "alpine:3.18", 
+      "label": "alpine3.18",
+      "description": "Alpine Linux 3.18 - previous stable",
+      "platforms": ["linux/amd64", "linux/arm64", "linux/arm/v7"],
+      "paths": [
+        "/usr/bin/**/*",
+        "/bin/**/*",
+        "/sbin/**/*", 
+        "/usr/sbin/**/*",
+        "/usr/local/bin/**/*"
+      ],
+      "include_patterns": ["*"],
+      "exclude_patterns": ["*.txt", "*.conf", "*.md"]
+    },
+    {
+      "image": "ubuntu:24.04",
+      "label": "ubuntu24.04", 
+      "description": "Ubuntu 24.04 LTS - modern desktop/server",
+      "platforms": ["linux/amd64", "linux/arm64", "linux/arm/v7"],
+      "paths": [
+        "/usr/bin/**/*",
+        "/bin/**/*",
+        "/sbin/**/*",
+        "/usr/sbin/**/*", 
+        "/usr/local/bin/**/*",
+        "/usr/local/sbin/**/*"
+      ],
+      "include_patterns": ["*"],
+      "exclude_patterns": ["*.txt", "*.conf", "*.md", "*.1", "*.8", "*.gz"]
+    },
+    {
+      "image": "ubuntu:22.04",
+      "label": "ubuntu22.04",
+      "description": "Ubuntu 22.04 LTS - stable server",
+      "platforms": ["linux/amd64", "linux/arm64", "linux/arm/v7"], 
+      "paths": [
+        "/usr/bin/**/*",
+        "/bin/**/*",
+        "/sbin/**/*",
+        "/usr/sbin/**/*",
+        "/usr/local/sbin/**/*"
+      ],
+      "include_patterns": ["*"],
+      "exclude_patterns": ["*.txt", "*.conf", "*.md"]
+    },
+    {
+      "image": "ubuntu:20.04",
+      "label": "ubuntu20.04",
+      "description": "Ubuntu 20.04 LTS - legacy compatibility",
+      "platforms": ["linux/amd64", "linux/arm64", "linux/arm/v7"],
+      "paths": [
+        "/usr/bin/**/*",
+        "/bin/**/*", 
+        "/sbin/**/*",
+        "/usr/sbin/**/*",
+        "/usr/local/sbin/**/*"
+      ],
+      "include_patterns": ["*"],
+      "exclude_patterns": ["*.txt", "*.conf"]
+    },
+    {
+      "image": "debian:bookworm",
+      "label": "debian-bookworm",
+      "description": "Debian 12 Bookworm - stable server focus",
+      "platforms": ["linux/amd64", "linux/arm64", "linux/arm/v7"],
+      "paths": [
+        "/usr/bin/**/*",
+        "/bin/**/*",
+        "/sbin/**/*", 
+        "/usr/sbin/**/*",
+        "/usr/local/bin/**/*",
+        "/usr/local/sbin/**/*"
+      ],
+      "include_patterns": ["*"],
+      "exclude_patterns": ["*.txt", "*.conf", "*.md"]
+    },
+    {
+      "image": "debian:bullseye",
+      "label": "debian-bullseye", 
+      "description": "Debian 11 Bullseye - previous stable",
+      "platforms": ["linux/amd64", "linux/arm64", "linux/arm/v7"],
+      "paths": [
+        "/usr/bin/**/*",
+        "/bin/**/*",
+        "/sbin/**/*",
+        "/usr/sbin/**/*" 
+      ],
+      "include_patterns": ["*"],
+      "exclude_patterns": ["*.txt", "*.conf"]
+    },
+    {
+      "image": "rockylinux:9",
+      "label": "rockylinux9",
+      "description": "Rocky Linux 9 - RHEL clone enterprise",
+      "platforms": ["linux/amd64", "linux/arm64"],
+      "paths": [
+        "/usr/bin/**/*",
+        "/bin/**/*",
+        "/sbin/**/*",
+        "/usr/sbin/**/*",
+        "/usr/local/bin/**/*"
+      ],
+      "include_patterns": ["*"], 
+      "exclude_patterns": ["*.txt", "*.conf", "*.md"]
+    },
+    {
+      "image": "almalinux:9",
+      "label": "almalinux9",
+      "description": "AlmaLinux 9 - RHEL clone community", 
+      "platforms": ["linux/amd64", "linux/arm64"],
+      "paths": [
+        "/usr/bin/**/*",
+        "/bin/**/*",
+        "/sbin/**/*",
+        "/usr/sbin/**/*",
+        "/usr/local/bin/**/*"
+      ],
+      "include_patterns": ["*"],
+      "exclude_patterns": ["*.txt", "*.conf", "*.md"]
+    }
+  ]
+}

@@ -1,0 +1,80 @@
+# Binary Extraction Outputs
+binaries/
+temp_extraction/
+binaries_test/
+
+# Python Environment
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual Environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# UV Package Manager
+.python-version
+
+# Logs and Reports
+logs/
+*.log
+extraction_report.json
+extraction_summary.json
+
+# IDE and Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# macOS
+.DS_Store
+
+# Docker
+.dockerignore
+
+# Temporary Files
+*.tmp
+*.temp
+temp/
+tmp/
+
+# Archive/Backup
+archive/
+backup/
+*.bak
+
+# Test Configurations
+*_test_config.json
+test_config.json
+rocky_test_config.json
+
+# OS Generated Files
+Thumbs.db
+ehthumbs.db
+Desktop.ini
