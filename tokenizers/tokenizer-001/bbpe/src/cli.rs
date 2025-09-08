@@ -52,6 +52,14 @@ pub enum Commands {
         #[arg(long, default_value_t = true)]
         boundaries: bool,
 
+        /// Enable high-entropy chunk filtering
+        #[arg(long, default_value_t = true)]
+        entropy_filter: bool,
+
+        /// Shannon entropy cutoff (bits/byte) to drop chunks
+        #[arg(long, default_value_t = 7.0)]
+        entropy_cutoff: f64,
+
         /// Vocab size target (BPE)
         #[arg(long, default_value_t = 32768)]
         vocab_size: usize,
@@ -97,6 +105,8 @@ pub fn run() -> Result<()> {
             max_chunk_exp,
             seed,
             boundaries,
+            entropy_filter,
+            entropy_cutoff,
             vocab_size,
             min_frequency,
             progress,
@@ -112,6 +122,9 @@ pub fn run() -> Result<()> {
                 hidden: false,
                 min_file_size: None,
                 max_file_size: None,
+                entropy_filter,
+                entropy_cutoff,
+                entropy_min_len: 16,
             };
             let files = collect_files(&input, &ingest_cfg);
             if files.is_empty() {

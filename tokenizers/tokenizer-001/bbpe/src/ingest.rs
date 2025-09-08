@@ -23,6 +23,12 @@ pub struct IngestConfig {
     pub hidden: bool,         // include hidden files
     pub min_file_size: Option<u64>,
     pub max_file_size: Option<u64>,
+    // Drop chunks whose estimated Shannon entropy (bits/byte) exceeds this cutoff
+    // when `entropy_filter` is true. Default configured via CLI.
+    pub entropy_filter: bool,
+    pub entropy_cutoff: f64,
+    // Only apply entropy filter if chunk length is strictly greater than this.
+    pub entropy_min_len: usize,
 }
 
 fn should_include(entry: &walkdir::DirEntry, cfg: &IngestConfig) -> bool {
@@ -142,6 +148,32 @@ impl CorpusIter {
     }
 }
 
+#[inline]
+fn shannon_entropy_bits_per_byte(bytes: &[u8]) -> f64 {
+    // Extremely fast, branch-light entropy estimate over 256 bins.
+    // Computes H = (n * ln n - sum_i c_i * ln c_i) / (n * ln 2)
+    // Safe for empty/degenerate inputs.
+    let n = bytes.len();
+    if n <= 1 {
+        return 0.0;
+    }
+    let mut counts = [0u32; 256];
+    for &b in bytes {
+        counts[b as usize] = counts[b as usize].saturating_add(1);
+    }
+    let n_f = n as f64;
+    let ln_n = n_f.ln();
+    let mut sum = 0.0_f64;
+    for &c in &counts {
+        if c != 0 {
+            let cf = c as f64;
+            sum += cf * cf.ln();
+        }
+    }
+    let h_nats = n_f * ln_n - sum;
+    h_nats / (n_f * std::f64::consts::LN_2)
+}
+
 impl Iterator for CorpusIter {
     type Item = String;
 
@@ -213,6 +245,14 @@ impl Iterator for CorpusIter {
             }
 
             // Convert to latin-1 string and yield
+            // Optional entropy filter before converting
+            if self.cfg.entropy_filter && buf.len() > self.cfg.entropy_min_len {
+                let h = shannon_entropy_bits_per_byte(&buf);
+                if h > self.cfg.entropy_cutoff {
+                    // Skip this chunk; continue reading from current file
+                    continue;
+                }
+            }
             let s = bytes_to_latin1_string(&buf);
             // Empty strings are unusual; skip
             if s.is_empty() {
