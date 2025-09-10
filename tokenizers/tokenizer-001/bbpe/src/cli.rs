@@ -36,17 +36,22 @@ pub enum Commands {
         #[arg(long, default_value_t = 4096)]
         fixed_bytes: usize,
 
-        /// Random chunk size exponent min (2^min)
+        /// Random chunk size exponent min (inclusive, uses 2^min)
         #[arg(long, default_value_t = 3)]
         min_chunk_exp: u8,
 
-        /// Random chunk size exponent max (2^max)
+        /// Random chunk size exponent max (exclusive, uses 2^p for p < max)
         #[arg(long, default_value_t = 14)]
         max_chunk_exp: u8,
 
         /// Random seed
         #[arg(long, default_value_t = 42)]
         seed: u64,
+
+        /// Random sampling rate for chunks (0.0..=1.0)
+        /// A value of 0.1 keeps ~1/10 chunks; 1.0 keeps all
+        #[arg(long, default_value_t = 1.0)]
+        sample_rate: f64,
 
         /// Add <|start|> and <|end|> around files
         #[arg(long, default_value_t = true)]
@@ -104,6 +109,7 @@ pub fn run() -> Result<()> {
             min_chunk_exp,
             max_chunk_exp,
             seed,
+            sample_rate,
             boundaries,
             entropy_filter,
             entropy_cutoff,
@@ -125,6 +131,9 @@ pub fn run() -> Result<()> {
                 entropy_filter,
                 entropy_cutoff,
                 entropy_min_len: 16,
+                // Clamp sample_rate to [0.0, 1.0]
+                sample_rate: sample_rate.clamp(0.0, 1.0),
+                seed,
             };
             let files = collect_files(&input, &ingest_cfg);
             if files.is_empty() {

@@ -12,7 +12,8 @@ pub enum ChunkingMode {
     Complete,
     // Fixed-size chunks in bytes
     Fixed { size: usize },
-    // Random chunk sizes between 2^min_exp and 2^max_exp inclusive
+    // Random chunk sizes with exponent p in [min_exp, max_exp), i.e. size = 2^p
+    // Upper bound is exclusive to avoid off-by-one when specifying the range.
     Random { min_exp: u8, max_exp: u8, seed: u64 },
 }
 
@@ -29,6 +30,10 @@ pub struct IngestConfig {
     pub entropy_cutoff: f64,
     // Only apply entropy filter if chunk length is strictly greater than this.
     pub entropy_min_len: usize,
+    // Probabilistic sampling of chunks after filtering (0.0..=1.0). 1.0 keeps all.
+    pub sample_rate: f64,
+    // Seed used for deterministic sampling decisions.
+    pub seed: u64,
 }
 
 fn should_include(entry: &walkdir::DirEntry, cfg: &IngestConfig) -> bool {
@@ -88,6 +93,8 @@ pub struct CorpusIter {
     emitted_end: bool,
     // For random mode
     rng: Option<StdRng>,
+    // For sampling decisions (independent of chunk size RNG)
+    sampler_rng: StdRng,
 }
 
 impl CorpusIter {
@@ -96,6 +103,7 @@ impl CorpusIter {
             ChunkingMode::Random { seed, .. } => Some(StdRng::seed_from_u64(*seed)),
             _ => None,
         };
+        let sampler_rng = StdRng::seed_from_u64(cfg.seed);
         Self {
             files,
             cfg,
@@ -105,6 +113,7 @@ impl CorpusIter {
             emitted_start: false,
             emitted_end: false,
             rng,
+            sampler_rng,
         }
     }
 
@@ -136,12 +145,14 @@ impl CorpusIter {
             ChunkingMode::Random { min_exp, max_exp, .. } => {
                 let min = min_exp.min(max_exp);
                 let max = max_exp.max(min_exp);
+                // Exclusive upper bound: if equal, use min; otherwise sample in [min, max)
                 if let Some(rng) = &mut self.rng {
-                    let p = rng.gen_range(min..=max);
+                    let p = if min == max { min } else { rng.gen_range(min..max) };
                     1usize << p
                 } else {
-                    // Fallback deterministic mid-range
-                    1usize << ((min + max) / 2)
+                    // Fallback deterministic: choose a midpoint strictly below max when possible
+                    let p = if min + 1 >= max { min } else { (min + max) / 2 };
+                    1usize << p
                 }
             }
         }
@@ -257,6 +268,18 @@ impl Iterator for CorpusIter {
             // Empty strings are unusual; skip
             if s.is_empty() {
                 continue;
+            }
+            // Apply random downsampling to content chunks only (not boundaries)
+            if self.cfg.sample_rate < 1.0 {
+                if self.cfg.sample_rate <= 0.0 {
+                    // Drop all content chunks
+                    continue;
+                }
+                let r: f64 = self.sampler_rng.gen();
+                if r >= self.cfg.sample_rate {
+                    // Skip this chunk
+                    continue;
+                }
             }
             return Some(s);
         }
