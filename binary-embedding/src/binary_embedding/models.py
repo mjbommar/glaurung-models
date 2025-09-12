@@ -259,4 +259,3 @@ class BinaryEmbeddingModelWithPooler(nn.Module):
                 return_dict=True,
             )
             return outputs.pooler_output
-

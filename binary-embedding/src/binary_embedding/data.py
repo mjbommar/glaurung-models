@@ -85,13 +85,12 @@ class BinaryDataset(Dataset):
                     if not chunk:
                         break
 
-                    # Convert bytes to hex representation with spacing
-                    hex_string = chunk.hex()
-                    spaced_hex = " ".join(
-                        hex_string[i : i + 2] for i in range(0, len(hex_string), 2)
-                    )
+                    # Convert bytes to latin-1 string
+                    # This preserves each byte as a character (0-255 -> char)
+                    # This is how the tokenizer was originally trained
+                    latin1_string = chunk.decode("latin-1")
 
-                    self.chunks.append(spaced_hex)
+                    self.chunks.append(latin1_string)
 
         except Exception:
             pass  # Skip files that can't be read
@@ -274,4 +273,3 @@ def create_dataloader(
     )
 
     return dataloader
-
