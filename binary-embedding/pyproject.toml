@@ -1,0 +1,37 @@
+[project]
+name = "binary-embedding"
+version = "0.1.0"
+description = "Train BERT/RoBERTa models on binary executable files"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "accelerate>=1.10.1",
+    "click>=8.1.0",
+    "rich>=13.0.0",
+    "tokenizers>=0.22.0",
+    "torch>=2.8.0",
+    "transformers>=4.56.1",
+]
+
+[project.scripts]
+binary-embedding = "binary_embedding.cli:cli"
+
+[tool.ruff]
+line-length = 88
+target-version = "py312"
+fix = true
+
+[tool.ruff.lint]
+select = [
+    "E",  # pycodestyle errors
+    "W",  # pycodestyle warnings
+    "F",  # pyflakes
+    "I",  # isort
+    "B",  # flake8-bugbear
+    "UP", # pyupgrade
+]
+ignore = []
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
