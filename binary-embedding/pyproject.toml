@@ -9,12 +9,26 @@ dependencies = [
     "click>=8.1.0",
     "rich>=13.0.0",
     "tokenizers>=0.22.0",
-    "torch>=2.8.0",
+    "torch==2.7.0",
     "transformers>=4.56.1",
+    "wandb>=0.21.4",
 ]
 
 [project.scripts]
 binary-embedding = "binary_embedding.cli:cli"
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu128" }
+
+[tool.uv]
+override-dependencies = [
+    "triton ; sys_platform == 'win32'",  # Triton doesn't have ARM64 wheels
+]
 
 [tool.ruff]
 line-length = 88

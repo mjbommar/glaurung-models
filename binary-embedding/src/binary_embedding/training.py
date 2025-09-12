@@ -26,6 +26,14 @@ from transformers import PreTrainedModel, get_linear_schedule_with_warmup
 from binary_embedding.models import BinaryEmbeddingConfig
 from binary_embedding.tokenizer import BinaryTokenizer
 
+# Import WandB if available
+try:
+    import wandb
+
+    WANDB_AVAILABLE = True
+except ImportError:
+    WANDB_AVAILABLE = False
+
 # Import advanced features if available
 try:
     from binary_embedding.metrics import (
@@ -99,6 +107,15 @@ class TrainerConfig:
     # Evaluation
     eval_steps: int = 500
     logging_steps: int = 10
+    assessment_steps: int = 10000  # Run full assessment every N steps
+    run_assessment: bool = False  # Whether to run periodic assessments
+
+    # WandB configuration
+    use_wandb: bool = True
+    wandb_project: str = "binary-embedding"
+    wandb_run_name: str | None = None
+    wandb_tags: list[str] | None = None
+    wandb_notes: str | None = None
 
     # Performance
     mixed_precision: bool = True
@@ -157,6 +174,7 @@ class Trainer:
         config: TrainerConfig,
         model_config: BinaryEmbeddingConfig | None = None,
         val_dataloader: DataLoader | None = None,
+        resume_from_checkpoint: Path | None = None,
     ) -> None:
         """Initialize the trainer.
 
@@ -167,6 +185,7 @@ class Trainer:
             config: Training configuration.
             model_config: Model configuration.
             val_dataloader: Optional validation data loader.
+            resume_from_checkpoint: Path to checkpoint to resume from.
         """
         self.model = model
         self.tokenizer = tokenizer
@@ -259,6 +278,16 @@ class Trainer:
         self.global_step = 0
         self.best_val_loss = float("inf")
         self.training_history: list[dict[str, Any]] = []
+        self.starting_epoch = 0
+
+        # Initialize WandB if enabled
+        self.wandb_run = None
+        if WANDB_AVAILABLE and config.use_wandb and self.accelerator.is_main_process:
+            self._init_wandb()
+
+        # Resume from checkpoint if provided
+        if resume_from_checkpoint:
+            self.load_checkpoint(resume_from_checkpoint)
 
     def _setup_optimizer(self) -> AdamW:
         """Setup AdamW optimizer with weight decay.
@@ -343,13 +372,57 @@ class Trainer:
             f"[cyan]Effective batch size: {self.config.batch_size * self.config.gradient_accumulation_steps}[/cyan]"
         )
 
-        epoch = 0
         should_stop = False
 
-        while self.global_step < self.total_steps and not should_stop:
-            epoch += 1
-            epoch_loss = 0.0
-            epoch_steps = 0
+        # Calculate number of epochs needed
+        # Note: steps_per_epoch should match the calculation used for total_steps
+        dataloader_len = len(self.train_dataloader)
+        steps_per_epoch = dataloader_len // self.config.gradient_accumulation_steps
+
+        # Debug info
+        console.print(f"[dim]Dataloader length: {dataloader_len} batches[/dim]")
+        console.print(
+            f"[dim]Gradient accumulation steps: {self.config.gradient_accumulation_steps}[/dim]"
+        )
+
+        # If num_epochs was specified in config, use that; otherwise calculate from total_steps
+        if self.config.max_steps:
+            num_epochs = (
+                self.total_steps + steps_per_epoch - 1
+            ) // steps_per_epoch  # Ceiling division
+        else:
+            num_epochs = self.config.num_epochs
+
+        console.print(f"[cyan]Steps per epoch: {steps_per_epoch}[/cyan]")
+        console.print(f"[cyan]Number of epochs: {num_epochs}[/cyan]")
+
+        # Start from the correct epoch if resuming
+        start_epoch = self.starting_epoch + 1 if hasattr(self, "starting_epoch") else 1
+        if start_epoch > 1:
+            console.print(f"[yellow]Resuming from epoch {start_epoch}[/yellow]")
+
+        for epoch in range(start_epoch, num_epochs + 1):
+            if should_stop or self.global_step >= self.total_steps:
+                break
+
+            # Initialize epoch metrics
+            # When resuming mid-epoch, start with last known loss to avoid 0.0000 display
+            if (
+                epoch == start_epoch
+                and self.global_step > 0
+                and len(self.training_history) > 0
+            ):
+                # Get the last logged loss
+                last_entry = self.training_history[-1]
+                epoch_loss = last_entry.get("loss", 0.0)
+                epoch_steps = 1  # Avoid division by zero
+            else:
+                epoch_loss = 0.0
+                epoch_steps = 0
+
+            # Calculate how many steps to show for this epoch
+            remaining_steps = self.total_steps - self.global_step
+            steps_this_epoch = min(steps_per_epoch, remaining_steps)
 
             with Progress(
                 TextColumn("[bold blue]Epoch {task.fields[epoch]}"),
@@ -362,15 +435,50 @@ class Trainer:
                 console=console,
                 disable=not self.accelerator.is_local_main_process,
             ) as progress:
-                task = progress.add_task(
-                    "Training",
-                    total=len(self.train_dataloader),
-                    epoch=epoch,
-                    loss=0.0,
-                    lr=self.config.learning_rate,
+                # Get current learning rate (especially important when resuming)
+                current_lr = (
+                    self.scheduler.get_last_lr()[0]
+                    if hasattr(self.scheduler, "get_last_lr")
+                    else self.config.learning_rate
                 )
 
-                for _batch_idx, batch in enumerate(self.train_dataloader):
+                # Progress bar tracks STEPS, not batches
+                # Initialize with current loss if resuming
+                initial_loss = epoch_loss / epoch_steps if epoch_steps > 0 else 0.0
+                task = progress.add_task(
+                    "Training",
+                    total=steps_this_epoch,
+                    epoch=epoch,
+                    loss=initial_loss,
+                    lr=current_lr,
+                )
+
+                # Calculate batches to skip if resuming mid-epoch
+                batches_to_skip = 0
+                steps_to_skip = 0
+                if epoch == start_epoch and self.global_step > 0:
+                    # Check if we're actually mid-epoch (not at an epoch boundary)
+                    steps_in_epoch = self.global_step % steps_per_epoch
+                    if steps_in_epoch > 0:
+                        # We're resuming mid-epoch, need to skip already processed batches
+                        batches_to_skip = (
+                            steps_in_epoch * self.config.gradient_accumulation_steps
+                        )
+                        steps_to_skip = steps_in_epoch
+                        console.print(
+                            f"[dim]Resuming epoch {epoch} from step {steps_in_epoch}/{steps_per_epoch}[/dim]"
+                        )
+                        console.print(
+                            f"[dim]Skipping {batches_to_skip} batches already processed[/dim]"
+                        )
+                        # Update progress bar to show we're starting from the middle
+                        progress.update(task, completed=steps_to_skip)
+
+                for batch_idx, batch in enumerate(self.train_dataloader):
+                    # Skip batches if resuming mid-epoch
+                    if batch_idx < batches_to_skip:
+                        continue
+
                     if self.global_step >= self.total_steps:
                         break
 
@@ -387,117 +495,157 @@ class Trainer:
                         # Backward pass
                         self.accelerator.backward(loss)
 
-                        # Gradient clipping
+                        # Only do optimizer step when gradients are synchronized
                         if self.accelerator.sync_gradients:
+                            # Gradient clipping
                             grad_norm = self.accelerator.clip_grad_norm_(
                                 self.model.parameters(),
                                 self.config.max_grad_norm,
                             )
+
+                            # Optimizer step
+                            self.optimizer.step()
+                            self.scheduler.step()
+                            self.optimizer.zero_grad()
                         else:
                             grad_norm = 0.0
 
-                        # Optimizer step
-                        self.optimizer.step()
-                        self.scheduler.step()
-                        self.optimizer.zero_grad()
+                    # Only update metrics and progress on actual optimizer steps
+                    # (not on every batch during gradient accumulation)
+                    if self.accelerator.sync_gradients:
+                        # This is an actual optimizer step
+                        epoch_loss += loss.detach().float()
+                        epoch_steps += 1
+                        self.global_step += 1
 
-                    # Update metrics
-                    epoch_loss += loss.detach().float()
-                    epoch_steps += 1
-                    self.global_step += 1
-
-                    # Update progress bar
-                    current_loss = epoch_loss / epoch_steps
-                    current_lr = self.scheduler.get_last_lr()[0]
-                    progress.update(
-                        task,
-                        advance=1,
-                        loss=current_loss,
-                        lr=current_lr,
-                    )
-
-                    # Log metrics
-                    if self.global_step % self.config.logging_steps == 0:
-                        log_dict = {
-                            "step": self.global_step,
-                            "epoch": epoch,
-                            "loss": float(current_loss),
-                            "learning_rate": float(current_lr),
-                        }
-
-                        if self.accelerator.sync_gradients:
-                            log_dict["gradient_norm"] = float(grad_norm)
-
-                        self.training_history.append(log_dict)
-
-                        # Limit history size to prevent memory issues
-                        if len(self.training_history) > 10000:
-                            self.training_history = self.training_history[-5000:]
-
-                        # Track in metrics object if available
-                        if self.metrics:
-                            self.metrics.log(
-                                {
-                                    "mlm_loss": float(current_loss),
-                                    "learning_rate": float(current_lr),
-                                    "gradient_norm": float(grad_norm)
-                                    if self.accelerator.sync_gradients
-                                    else 0.0,
-                                },
-                                self.global_step,
-                            )
-
-                    # Evaluation
-                    if (
-                        self.val_dataloader
-                        and self.global_step % self.config.eval_steps == 0
-                    ):
-                        val_loss = self.evaluate()
-                        self.model.train()
-
-                        # Check for improvement
-                        improved = val_loss < self.best_val_loss
-                        if improved:
-                            self.best_val_loss = val_loss
-                            if self.config.save_best_only:
-                                self.save_checkpoint(is_best=True)
-
-                        console.print(
-                            f"[yellow]Step {self.global_step} - "
-                            f"Val Loss: {val_loss:.4f} "
-                            f"{'(improved)' if improved else ''}[/yellow]"
+                        # Update progress bar (once per step, not per batch)
+                        current_loss = epoch_loss / epoch_steps
+                        current_lr = self.scheduler.get_last_lr()[0]
+                        progress.update(
+                            task,
+                            advance=1,
+                            loss=current_loss,
+                            lr=current_lr,
                         )
 
-                        # Early stopping check
-                        if self.early_stopping:
-                            metrics_dict = {"mlm_loss": val_loss}
+                        # Log metrics (only after we have computed current_loss)
+                        if self.global_step % self.config.logging_steps == 0:
+                            log_dict = {
+                                "step": self.global_step,
+                                "epoch": epoch,
+                                "loss": float(current_loss),
+                                "learning_rate": float(current_lr),
+                            }
 
-                            # Add embedding quality if monitored
-                            if (
-                                self.embedding_monitor
-                                and self.config.monitor_embedding_quality
-                            ):
-                                quality = self._compute_embedding_quality()
-                                metrics_dict["embedding_quality"] = quality
-                                console.print(
-                                    f"[yellow]Embedding quality: {quality:.4f}[/yellow]"
+                            if self.accelerator.sync_gradients:
+                                log_dict["gradient_norm"] = float(grad_norm)
+
+                            self.training_history.append(log_dict)
+
+                            # Log to WandB
+                            if self.wandb_run and self.accelerator.is_main_process:
+                                wandb_log = {
+                                    "train/loss": float(current_loss),
+                                    "train/learning_rate": float(current_lr),
+                                    "train/epoch": epoch,
+                                    "train/global_step": self.global_step,
+                                }
+                                if self.accelerator.sync_gradients:
+                                    wandb_log["train/gradient_norm"] = float(grad_norm)
+
+                                wandb.log(wandb_log, step=self.global_step)
+
+                            # Limit history size to prevent memory issues
+                            if len(self.training_history) > 10000:
+                                self.training_history = self.training_history[-5000:]
+
+                            # Track in metrics object if available
+                            if self.metrics:
+                                self.metrics.log(
+                                    {
+                                        "mlm_loss": float(current_loss),
+                                        "learning_rate": float(current_lr),
+                                        "gradient_norm": float(grad_norm)
+                                        if self.accelerator.sync_gradients
+                                        else 0.0,
+                                    },
+                                    self.global_step,
                                 )
 
-                            should_stop = self.early_stopping(metrics_dict, self.model)
-                            if should_stop:
-                                console.print("[red]Early stopping triggered![/red]")
-                                break
+                        # Evaluation
+                        if (
+                            self.val_dataloader
+                            and self.global_step % self.config.eval_steps == 0
+                        ):
+                            val_loss = self.evaluate()
+                            self.model.train()
 
-                    # Save checkpoint
-                    if (
-                        not self.config.save_best_only
-                        and self.global_step % self.config.save_steps == 0
-                    ):
-                        self.save_checkpoint()
+                            # Check for improvement
+                            improved = val_loss < self.best_val_loss
+                            if improved:
+                                self.best_val_loss = val_loss
+                                if self.config.save_best_only:
+                                    self.save_checkpoint(is_best=True)
 
-                    # Periodically clear GPU cache to prevent memory fragmentation
-                    if self.global_step % 100 == 0 and torch.cuda.is_available():
-                        torch.cuda.empty_cache()
+                            console.print(
+                                f"[yellow]Step {self.global_step} - "
+                                f"Val Loss: {val_loss:.4f} "
+                                f"{'(improved)' if improved else ''}[/yellow]"
+                            )
+
+                            # Log validation loss to WandB
+                            if self.wandb_run and self.accelerator.is_main_process:
+                                wandb.log(
+                                    {"eval/loss": val_loss}, step=self.global_step
+                                )
+
+                            # Early stopping check
+                            if self.early_stopping:
+                                metrics_dict = {"mlm_loss": val_loss}
+
+                                # Add embedding quality if monitored
+                                if (
+                                    self.embedding_monitor
+                                    and self.config.monitor_embedding_quality
+                                ):
+                                    quality = self._compute_embedding_quality()
+                                    metrics_dict["embedding_quality"] = quality
+                                    console.print(
+                                        f"[yellow]Embedding quality: {quality:.4f}[/yellow]"
+                                    )
+
+                                should_stop = self.early_stopping(
+                                    metrics_dict, self.model
+                                )
+                                if should_stop:
+                                    console.print(
+                                        "[red]Early stopping triggered![/red]"
+                                    )
+                                    break
+
+                        # Run periodic assessment
+                        if (
+                            self.config.run_assessment
+                            and self.global_step % self.config.assessment_steps == 0
+                            and self.global_step > 0
+                        ):
+                            assessment_results = self.run_assessment()
+
+                            # Log assessment results to WandB
+                            if self.wandb_run and self.accelerator.is_main_process:
+                                wandb.log(assessment_results, step=self.global_step)
+
+                        # Save checkpoint
+                        if (
+                            not self.config.save_best_only
+                            and self.global_step % self.config.save_steps == 0
+                            and self.global_step > 0
+                        ):
+                            self.save_checkpoint()
+
+                        # Periodically clear GPU cache to prevent memory fragmentation
+                        if self.global_step % 100 == 0 and torch.cuda.is_available():
+                            torch.cuda.empty_cache()
 
             # End of epoch
             avg_epoch_loss = epoch_loss / epoch_steps if epoch_steps > 0 else 0
@@ -515,6 +663,27 @@ class Trainer:
             metrics_path = self.output_dir / "training_metrics.json"
             self.metrics.save(metrics_path)
             console.print(f"[dim]Saved metrics to {metrics_path}[/dim]")
+
+        # Run final assessment
+        if self.config.run_assessment:
+            console.print("[yellow]Running final assessment...[/yellow]")
+            final_assessment = self.run_assessment()
+
+            # Save assessment results
+            assessment_path = self.output_dir / "final_assessment.json"
+            with open(assessment_path, "w") as f:
+                json.dump(final_assessment, f, indent=2)
+            console.print(f"[dim]Saved final assessment to {assessment_path}[/dim]")
+
+            # Log to WandB
+            if self.wandb_run and self.accelerator.is_main_process:
+                # Add "final/" prefix to distinguish from periodic assessments
+                final_metrics = {f"final/{k}": v for k, v in final_assessment.items()}
+                wandb.log(final_metrics, step=self.global_step)
+
+        # Finish WandB run
+        if self.wandb_run:
+            wandb.finish()
 
         console.print("[bold green]Training complete![/bold green]")
 
@@ -603,11 +772,18 @@ class Trainer:
             unwrapped_model.base_model.save_pretrained(checkpoint_dir)
         else:
             # Save state dict as fallback
-            self.tokenizer.tokenizer.save_pretrained(checkpoint_dir)
             torch.save(
                 unwrapped_model.state_dict(),
                 checkpoint_dir / "pytorch_model.bin",
             )
+
+        # Always save tokenizer
+        if hasattr(self.tokenizer, "tokenizer"):
+            # BinaryTokenizer wraps the actual tokenizer
+            self.tokenizer.tokenizer.save(str(checkpoint_dir / "tokenizer.json"))
+        else:
+            # In case it's a different tokenizer type
+            self.tokenizer.save_pretrained(checkpoint_dir)
 
         # Save training state
         torch.save(
@@ -626,6 +802,220 @@ class Trainer:
         # Clean up old checkpoints if limit is set
         if self.config.save_total_limit and not is_best and not is_final:
             self._cleanup_checkpoints()
+
+    def load_checkpoint(self, checkpoint_path: Path) -> None:
+        """Load training state from checkpoint.
+
+        Args:
+            checkpoint_path: Path to checkpoint directory.
+        """
+        checkpoint_path = Path(checkpoint_path)
+
+        # Load training state
+        training_state_path = checkpoint_path / "training_state.pt"
+        if training_state_path.exists():
+            state = torch.load(
+                training_state_path, map_location=self.accelerator.device
+            )
+
+            # Restore training state
+            self.global_step = state["global_step"]
+            self.best_val_loss = state.get("best_val_loss", float("inf"))
+
+            # Restore optimizer and scheduler states
+            try:
+                self.optimizer.load_state_dict(state["optimizer_state_dict"])
+                self.scheduler.load_state_dict(state["scheduler_state_dict"])
+
+                # Verify the learning rate is correctly restored
+                current_lr = self.scheduler.get_last_lr()[0]
+                console.print(f"[dim]  Learning rate restored: {current_lr:.2e}[/dim]")
+
+                # Debug: print scheduler state for verification
+                if hasattr(self.scheduler, "state_dict"):
+                    scheduler_state = self.scheduler.state_dict()
+                    console.print(
+                        f"[dim]  Scheduler last_epoch: {scheduler_state.get('last_epoch', 'N/A')}[/dim]"
+                    )
+                    console.print(
+                        f"[dim]  Scheduler _step_count: {scheduler_state.get('_step_count', 'N/A')}[/dim]"
+                    )
+            except Exception as e:
+                console.print(
+                    f"[yellow]⚠ Warning: Could not fully restore optimizer/scheduler state: {e}[/yellow]"
+                )
+                console.print(
+                    "[yellow]  Training will continue but learning rate schedule may be reset[/yellow]"
+                )
+
+            # Calculate starting epoch based on global_step
+            steps_per_epoch = (
+                len(self.train_dataloader) // self.config.gradient_accumulation_steps
+            )
+            self.starting_epoch = self.global_step // steps_per_epoch
+
+            console.print(
+                f"[green]✓ Resumed from checkpoint at step {self.global_step}[/green]"
+            )
+            console.print(f"[dim]  Starting from epoch {self.starting_epoch + 1}[/dim]")
+            console.print(
+                f"[dim]  Best validation loss: {self.best_val_loss:.4f}[/dim]"
+            )
+
+            # Load training history if it exists
+            history_path = checkpoint_path.parent / "training_history.json"
+            if history_path.exists():
+                import json
+
+                with open(history_path) as f:
+                    self.training_history = json.load(f)
+                console.print(
+                    f"[dim]  Training history loaded: {len(self.training_history)} entries[/dim]"
+                )
+        else:
+            console.print(
+                f"[yellow]⚠ No training state found at {checkpoint_path}, starting fresh[/yellow]"
+            )
+
+    def _init_wandb(self) -> None:
+        """Initialize WandB run with configuration."""
+        if not WANDB_AVAILABLE:
+            return
+
+        # Prepare config for logging
+        wandb_config = {
+            # Model configuration
+            "model_type": self.model_config.model_type
+            if self.model_config
+            else "unknown",
+            "vocab_size": self.model_config.vocab_size if self.model_config else None,
+            "hidden_size": self.model_config.hidden_size if self.model_config else None,
+            "num_hidden_layers": self.model_config.num_hidden_layers
+            if self.model_config
+            else None,
+            "num_attention_heads": self.model_config.num_attention_heads
+            if self.model_config
+            else None,
+            "intermediate_size": self.model_config.intermediate_size
+            if self.model_config
+            else None,
+            "max_position_embeddings": self.model_config.max_position_embeddings
+            if self.model_config
+            else None,
+            "mlm_probability": self.model_config.mlm_probability
+            if self.model_config
+            else None,
+            # Training configuration
+            "learning_rate": self.config.learning_rate,
+            "batch_size": self.config.batch_size,
+            "gradient_accumulation_steps": self.config.gradient_accumulation_steps,
+            "effective_batch_size": self.config.batch_size
+            * self.config.gradient_accumulation_steps,
+            "num_epochs": self.config.num_epochs,
+            "max_steps": self.config.max_steps,
+            "warmup_steps": self.config.warmup_steps,
+            "warmup_ratio": self.config.warmup_ratio,
+            "scheduler_type": self.config.scheduler_type,
+            "weight_decay": self.config.weight_decay,
+            "adam_beta1": self.config.adam_beta1,
+            "adam_beta2": self.config.adam_beta2,
+            "adam_epsilon": self.config.adam_epsilon,
+            "max_grad_norm": self.config.max_grad_norm,
+            "mixed_precision": self.config.mixed_precision,
+            "gradient_checkpointing": self.config.gradient_checkpointing,
+            # Dataset info
+            "dataloader_length": len(self.train_dataloader),
+            "total_steps": self.total_steps,
+            # Assessment configuration
+            "run_assessment": self.config.run_assessment,
+            "assessment_steps": self.config.assessment_steps,
+        }
+
+        # Initialize WandB run
+        self.wandb_run = wandb.init(
+            project=self.config.wandb_project,
+            name=self.config.wandb_run_name,
+            tags=self.config.wandb_tags,
+            notes=self.config.wandb_notes,
+            config=wandb_config,
+            resume="allow",
+        )
+
+        # Watch the model for gradient tracking (optional)
+        wandb.watch(self.model, log="all", log_freq=100)
+
+        console.print(f"[green]✓ WandB initialized: {self.wandb_run.url}[/green]")
+
+    def run_assessment(self) -> dict[str, float]:
+        """Run full assessment and return metrics."""
+        from binary_embedding.assessment import BinaryAssessment
+
+        console.print("[yellow]Running assessment...[/yellow]")
+
+        # Create assessment instance
+        assessment = BinaryAssessment(
+            model=self.accelerator.unwrap_model(self.model),
+            tokenizer=self.tokenizer,
+            device=self.accelerator.device,
+        )
+
+        # Run all assessments
+        results = {}
+
+        try:
+            # File header recognition
+            header_result = assessment.assess_file_header_recognition()
+            results["assessment/file_header_score"] = header_result.score
+            results["assessment/file_header_passed"] = float(header_result.passed)
+
+            # Binary pattern learning
+            pattern_result = assessment.assess_binary_pattern_learning()
+            results["assessment/pattern_learning_score"] = pattern_result.score
+            results["assessment/pattern_learning_passed"] = float(pattern_result.passed)
+
+            # Context understanding
+            context_result = assessment.assess_context_understanding()
+            results["assessment/context_understanding_score"] = context_result.score
+            results["assessment/context_understanding_passed"] = float(
+                context_result.passed
+            )
+
+            # Embedding quality
+            embedding_result = assessment.assess_embedding_quality()
+            results["assessment/embedding_quality_score"] = embedding_result.score
+            results["assessment/embedding_quality_passed"] = float(
+                embedding_result.passed
+            )
+
+            # Overall metrics
+            all_scores = [
+                header_result.score,
+                pattern_result.score,
+                context_result.score,
+                embedding_result.score,
+            ]
+            results["assessment/average_score"] = sum(all_scores) / len(all_scores)
+            results["assessment/pass_rate"] = (
+                sum(
+                    [
+                        header_result.passed,
+                        pattern_result.passed,
+                        context_result.passed,
+                        embedding_result.passed,
+                    ]
+                )
+                / 4.0
+            )
+
+            console.print(
+                f"[green]Assessment complete - Average score: {results['assessment/average_score']:.2%}[/green]"
+            )
+
+        except Exception as e:
+            console.print(f"[red]Assessment failed: {e}[/red]")
+            results["assessment/error"] = 1.0
+
+        return results
 
     def _cleanup_checkpoints(self) -> None:
         """Remove old checkpoints to maintain save_total_limit."""

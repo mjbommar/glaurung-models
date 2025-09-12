@@ -167,7 +167,7 @@ def load_tokenizer(
     """
     if tokenizer_path is None:
         tokenizer_path = Path(
-            "/home/mjbommar/src/glaurung-models/tokenizers/"
+            "/home/ubuntu/src/glaurung-models/tokenizers/"
             "tokenizer-001/tokenizers/binary-tokenizer-01/iteration-005/tokenizer.json"
         )
 

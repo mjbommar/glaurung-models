@@ -180,6 +180,53 @@ def cli() -> None:
     default=10,
     help="Log metrics every N steps",
 )
+@click.option(
+    "--resume-from-checkpoint",
+    type=click.Path(exists=True, path_type=Path),
+    default=None,
+    help="Resume training from a checkpoint directory",
+)
+@click.option(
+    "--run-assessment/--no-assessment",
+    default=False,
+    help="Run periodic assessments during training",
+)
+@click.option(
+    "--assessment-steps",
+    type=int,
+    default=10000,
+    help="Run assessment every N steps",
+)
+@click.option(
+    "--use-wandb/--no-wandb",
+    default=True,
+    help="Use Weights & Biases for logging",
+)
+@click.option(
+    "--wandb-project",
+    type=str,
+    default="binary-embedding",
+    help="WandB project name",
+)
+@click.option(
+    "--wandb-run-name",
+    type=str,
+    default=None,
+    help="WandB run name (auto-generated if not specified)",
+)
+@click.option(
+    "--wandb-tags",
+    type=str,
+    multiple=True,
+    default=None,
+    help="WandB tags (can be specified multiple times)",
+)
+@click.option(
+    "--wandb-notes",
+    type=str,
+    default=None,
+    help="WandB run notes",
+)
 def train(
     model_size: str,
     model_type: str,
@@ -207,6 +254,14 @@ def train(
     save_best_only: bool,
     eval_steps: int,
     logging_steps: int,
+    resume_from_checkpoint: Path | None,
+    run_assessment: bool,
+    assessment_steps: int,
+    use_wandb: bool,
+    wandb_project: str,
+    wandb_run_name: str | None,
+    wandb_tags: tuple[str, ...] | None,
+    wandb_notes: str | None,
 ) -> None:
     """Train a binary embedding model with optional advanced features."""
     # Display configuration
@@ -232,6 +287,13 @@ def train(
         save_best_only=save_best_only,
         eval_steps=eval_steps,
         logging_steps=logging_steps,
+        run_assessment=run_assessment,
+        assessment_steps=assessment_steps,
+        use_wandb=use_wandb,
+        wandb_project=wandb_project,
+        wandb_run_name=wandb_run_name,
+        wandb_tags=list(wandb_tags) if wandb_tags else None,
+        wandb_notes=wandb_notes,
     )
 
     # Apply user overrides
@@ -280,6 +342,10 @@ def train(
         config_table.add_row("Early Stopping", "✓")
     if monitor_embedding:
         config_table.add_row("Embedding Monitoring", "✓")
+    if run_assessment:
+        config_table.add_row("Periodic Assessment", f"Every {assessment_steps:,} steps")
+    if use_wandb:
+        config_table.add_row("WandB Logging", f"Project: {wandb_project}")
     config_table.add_row("Output Directory", str(output_dir))
 
     console.print(config_table)
@@ -294,19 +360,50 @@ def train(
         tokenizer = load_tokenizer(tokenizer_path)
         console.print(f"✓ Tokenizer loaded (vocab size: {tokenizer.vocab_size:,})")
 
-    # Create model
-    with console.status(f"[bold green]Creating {model_size} model..."):
-        size_enum = ModelSize(model_size)
-        model, model_config = create_model(size=size_enum)
-        model_config.model_type = model_type
-        model_config.learning_rate = base_config.learning_rate
-        model_config.warmup_steps = base_config.warmup_steps or int(
-            warmup_ratio * 10000
-        )
-        model_config.mlm_probability = mlm_probability
+    # Create or load model
+    if resume_from_checkpoint:
+        with console.status(
+            f"[bold green]Loading model from {resume_from_checkpoint}..."
+        ):
+            from transformers import AutoConfig, AutoModelForMaskedLM
 
-        total_params = sum(p.numel() for p in model.parameters())
-        console.print(f"✓ Model created ({total_params:,} parameters)")
+            # Load model config
+            config = AutoConfig.from_pretrained(resume_from_checkpoint)
+            model = AutoModelForMaskedLM.from_pretrained(resume_from_checkpoint)
+
+            # Create model_config for compatibility
+            from binary_embedding.models import BinaryEmbeddingConfig
+
+            model_config = BinaryEmbeddingConfig(
+                vocab_size=config.vocab_size,
+                hidden_size=config.hidden_size,
+                num_hidden_layers=config.num_hidden_layers,
+                num_attention_heads=config.num_attention_heads,
+                intermediate_size=config.intermediate_size,
+                max_position_embeddings=config.max_position_embeddings,
+                model_type=model_type,
+                learning_rate=base_config.learning_rate,
+                warmup_steps=base_config.warmup_steps or int(warmup_ratio * 10000),
+                mlm_probability=mlm_probability,
+            )
+
+            total_params = sum(p.numel() for p in model.parameters())
+            console.print(
+                f"✓ Model loaded from checkpoint ({total_params:,} parameters)"
+            )
+    else:
+        with console.status(f"[bold green]Creating {model_size} model..."):
+            size_enum = ModelSize(model_size)
+            model, model_config = create_model(size=size_enum)
+            model_config.model_type = model_type
+            model_config.learning_rate = base_config.learning_rate
+            model_config.warmup_steps = base_config.warmup_steps or int(
+                warmup_ratio * 10000
+            )
+            model_config.mlm_probability = mlm_probability
+
+            total_params = sum(p.numel() for p in model.parameters())
+            console.print(f"✓ Model created ({total_params:,} parameters)")
 
     # Create data loader
     with console.status(f"[bold green]Loading data from {data_dir}..."):
@@ -329,6 +426,7 @@ def train(
         train_dataloader=train_dataloader,
         config=base_config,
         model_config=model_config,
+        resume_from_checkpoint=resume_from_checkpoint,
     )
 
     # Train
