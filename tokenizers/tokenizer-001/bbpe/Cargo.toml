@@ -10,9 +10,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 walkdir = "2"
 rand = "0.8"
-
-# Use the local reference of tokenizers for compatibility
-tokenizers = { path = "../reference/tokenizers/tokenizers" }
+tokenizers = "0.22.0"
 
 [profile.release]
 codegen-units = 1

@@ -143,6 +143,130 @@
       ],
       "include_patterns": ["*"],
       "exclude_patterns": ["*.txt", "*.conf", "*.md"]
+    },
+    {
+      "image": "busybox:latest",
+      "label": "busybox-latest",
+      "description": "BusyBox - minimal Unix utilities",
+      "platforms": ["linux/amd64", "linux/arm64", "linux/arm/v7", "linux/arm/v6", "linux/386", "linux/ppc64le", "linux/s390x"],
+      "paths": [
+        "/bin/**/*",
+        "/sbin/**/*",
+        "/usr/bin/**/*",
+        "/usr/sbin/**/*"
+      ],
+      "include_patterns": ["*"],
+      "exclude_patterns": ["*.txt", "*.conf", "*.md"]
+    },
+    {
+      "image": "archlinux:latest",
+      "label": "archlinux-latest",
+      "description": "Arch Linux - rolling release cutting-edge",
+      "platforms": ["linux/amd64"],
+      "paths": [
+        "/usr/bin/**/*",
+        "/bin/**/*",
+        "/sbin/**/*",
+        "/usr/sbin/**/*",
+        "/usr/local/bin/**/*",
+        "/usr/local/sbin/**/*"
+      ],
+      "include_patterns": ["*"],
+      "exclude_patterns": ["*.txt", "*.conf", "*.md", "*.1", "*.8", "*.gz"]
+    },
+    {
+      "image": "openjdk:21-slim",
+      "label": "openjdk21-slim",
+      "description": "OpenJDK 21 - Java runtime slim",
+      "platforms": ["linux/amd64", "linux/arm64"],
+      "paths": [
+        "/usr/bin/**/*",
+        "/bin/**/*",
+        "/sbin/**/*",
+        "/usr/sbin/**/*",
+        "/usr/local/openjdk-21/bin/**/*",
+        "/opt/java/openjdk/bin/**/*"
+      ],
+      "include_patterns": ["*"],
+      "exclude_patterns": ["*.txt", "*.conf", "*.md", "*.properties"]
+    },
+    {
+      "image": "openjdk:17-slim",
+      "label": "openjdk17-slim",
+      "description": "OpenJDK 17 LTS - Java runtime slim",
+      "platforms": ["linux/amd64", "linux/arm64"],
+      "paths": [
+        "/usr/bin/**/*",
+        "/bin/**/*",
+        "/sbin/**/*",
+        "/usr/sbin/**/*",
+        "/usr/local/openjdk-17/bin/**/*",
+        "/opt/java/openjdk/bin/**/*"
+      ],
+      "include_patterns": ["*"],
+      "exclude_patterns": ["*.txt", "*.conf", "*.md", "*.properties"]
+    },
+    {
+      "image": "oraclelinux:9",
+      "label": "oraclelinux9",
+      "description": "Oracle Linux 9 - enterprise Linux",
+      "platforms": ["linux/amd64", "linux/arm64"],
+      "paths": [
+        "/usr/bin/**/*",
+        "/bin/**/*",
+        "/sbin/**/*",
+        "/usr/sbin/**/*",
+        "/usr/local/bin/**/*",
+        "/usr/local/sbin/**/*"
+      ],
+      "include_patterns": ["*"],
+      "exclude_patterns": ["*.txt", "*.conf", "*.md", "*.1", "*.8"]
+    },
+    {
+      "image": "oraclelinux:8-slim",
+      "label": "oraclelinux8-slim",
+      "description": "Oracle Linux 8 Slim - minimal enterprise",
+      "platforms": ["linux/amd64", "linux/arm64"],
+      "paths": [
+        "/usr/bin/**/*",
+        "/bin/**/*",
+        "/sbin/**/*",
+        "/usr/sbin/**/*",
+        "/usr/local/bin/**/*"
+      ],
+      "include_patterns": ["*"],
+      "exclude_patterns": ["*.txt", "*.conf", "*.md"]
+    },
+    {
+      "image": "amazonlinux:2023",
+      "label": "amazonlinux2023",
+      "description": "Amazon Linux 2023 - AWS optimized",
+      "platforms": ["linux/amd64", "linux/arm64"],
+      "paths": [
+        "/usr/bin/**/*",
+        "/bin/**/*",
+        "/sbin/**/*",
+        "/usr/sbin/**/*",
+        "/usr/local/bin/**/*",
+        "/usr/local/sbin/**/*"
+      ],
+      "include_patterns": ["*"],
+      "exclude_patterns": ["*.txt", "*.conf", "*.md", "*.1", "*.8"]
+    },
+    {
+      "image": "amazonlinux:2",
+      "label": "amazonlinux2",
+      "description": "Amazon Linux 2 - AWS stable",
+      "platforms": ["linux/amd64", "linux/arm64"],
+      "paths": [
+        "/usr/bin/**/*",
+        "/bin/**/*",
+        "/sbin/**/*",
+        "/usr/sbin/**/*",
+        "/usr/local/bin/**/*"
+      ],
+      "include_patterns": ["*"],
+      "exclude_patterns": ["*.txt", "*.conf", "*.md"]
     }
   ]
 }
