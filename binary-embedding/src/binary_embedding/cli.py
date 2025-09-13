@@ -13,6 +13,10 @@ from rich.table import Table
 from binary_embedding.assessment import load_and_assess_model
 from binary_embedding.data import create_dataloader
 from binary_embedding.models import ModelSize, create_model
+from binary_embedding.pair_data import (
+    create_pair_dataloader,
+    create_streaming_pair_dataloader,
+)
 from binary_embedding.tokenizer import load_tokenizer
 from binary_embedding.training import Trainer, TrainerConfig
 
@@ -136,6 +140,12 @@ def cli() -> None:
     help="Use mixed precision training",
 )
 @click.option(
+    "--gradient-checkpointing",
+    is_flag=True,
+    default=False,
+    help="Enable gradient checkpointing (reduces VRAM at some speed cost)",
+)
+@click.option(
     "--gradient-accumulation-steps",
     type=int,
     default=None,
@@ -227,6 +237,76 @@ def cli() -> None:
     default=None,
     help="WandB run notes",
 )
+@click.option(
+    "--streaming/--no-streaming",
+    default=False,
+    help="Use streaming dataset (background IO); recommended for network storage",
+)
+@click.option(
+    "--contrastive/--no-contrastive",
+    default=False,
+    help="Enable contrastive training with pair sampling",
+)
+@click.option(
+    "--pooling",
+    type=click.Choice(["mean", "cls"]),
+    default="mean",
+    help="Embedding pooling method for contrastive loss",
+)
+@click.option(
+    "--dup-prob",
+    type=float,
+    default=0.5,
+    help="Probability of duplicate-view pairs within a file",
+)
+@click.option(
+    "--pair-cache-size",
+    type=int,
+    default=4096,
+    help="LRU cache size (number of chunks) for pair dataset",
+)
+@click.option(
+    "--prefetch-factor",
+    type=int,
+    default=4,
+    help="DataLoader prefetch_factor (per worker) for pair dataset",
+)
+@click.option(
+    "--min-chunk-separation",
+    type=int,
+    default=None,
+    help="Minimum byte separation between chunks for same-file pairs (default: chunk-size)",
+)
+@click.option(
+    "--contrastive-temp",
+    type=float,
+    default=0.07,
+    help="Contrastive temperature",
+)
+@click.option(
+    "--mlm-weight",
+    type=float,
+    default=1.0,
+    help="Weight for MLM loss",
+)
+@click.option(
+    "--view-weight",
+    type=float,
+    default=0.5,
+    help="Weight for duplicate-view contrastive loss",
+)
+@click.option(
+    "--samefile-weight",
+    type=float,
+    default=0.5,
+    help="Weight for same-file contrastive loss",
+)
+@click.option(
+    "--contrastive-ramp-steps",
+    type=int,
+    default=0,
+    help="Linear ramp-in steps for contrastive loss weights",
+)
 def train(
     model_size: str,
     model_type: str,
@@ -246,6 +326,7 @@ def train(
     chunk_size: int,
     num_workers: int,
     mixed_precision: bool,
+    gradient_checkpointing: bool,
     gradient_accumulation_steps: int | None,
     early_stopping: bool,
     monitor_embedding: bool,
@@ -262,6 +343,18 @@ def train(
     wandb_run_name: str | None,
     wandb_tags: tuple[str, ...] | None,
     wandb_notes: str | None,
+    streaming: bool,
+    contrastive: bool,
+    pooling: str,
+    dup_prob: float,
+    pair_cache_size: int,
+    prefetch_factor: int,
+    min_chunk_separation: int | None,
+    contrastive_temp: float,
+    mlm_weight: float,
+    view_weight: float,
+    samefile_weight: float,
+    contrastive_ramp_steps: int,
 ) -> None:
     """Train a binary embedding model with optional advanced features."""
     # Display configuration
@@ -309,6 +402,8 @@ def train(
         base_config.scheduler_type = scheduler_type
     if warmup_steps is not None:
         base_config.warmup_steps = warmup_steps
+    if gradient_checkpointing:
+        base_config.gradient_checkpointing = True
 
     # Display configuration table
     config_table = Table(title="Training Configuration", show_header=False)
@@ -338,6 +433,8 @@ def train(
     config_table.add_row("Max Length", str(max_length))
     config_table.add_row("MLM Probability", f"{mlm_probability:.2%}")
     config_table.add_row("Mixed Precision", "✓" if mixed_precision else "✗")
+    if gradient_checkpointing:
+        config_table.add_row("Gradient Checkpointing", "✓")
     if early_stopping:
         config_table.add_row("Early Stopping", "✓")
     if monitor_embedding:
@@ -347,6 +444,19 @@ def train(
     if use_wandb:
         config_table.add_row("WandB Logging", f"Project: {wandb_project}")
     config_table.add_row("Output Directory", str(output_dir))
+    if contrastive:
+        config_table.add_row("Contrastive", "✓")
+        config_table.add_row("Pooling", pooling)
+        config_table.add_row("Dup Pair Prob", f"{dup_prob:.2f}")
+        config_table.add_row("Pair Cache Size", str(pair_cache_size))
+        config_table.add_row("Prefetch Factor", str(prefetch_factor))
+        if min_chunk_separation is not None:
+            config_table.add_row("Min Chunk Sep", str(min_chunk_separation))
+        config_table.add_row("Ctr Temp", f"{contrastive_temp:.2f}")
+        config_table.add_row(
+            "Loss Weights",
+            f"MLM={mlm_weight}, View={view_weight}, SameFile={samefile_weight}",
+        )
 
     console.print(config_table)
     console.print()
@@ -407,19 +517,77 @@ def train(
 
     # Create data loader
     with console.status(f"[bold green]Loading data from {data_dir}..."):
-        train_dataloader = create_dataloader(
-            directory_path=data_dir,
-            tokenizer=tokenizer,
-            batch_size=base_config.batch_size,
-            max_length=max_length,
-            chunk_size=chunk_size,
-            mlm_probability=mlm_probability,
-            num_workers=num_workers,
-            max_files=max_files,
-        )
-        console.print(f"✓ Data loaded ({len(train_dataloader)} batches)")
+        if contrastive:
+            if streaming:
+                train_dataloader = create_streaming_pair_dataloader(
+                    directory_path=data_dir,
+                    tokenizer=tokenizer,
+                    batch_size=base_config.batch_size,
+                    max_length=max_length,
+                    chunk_size=chunk_size,
+                    mlm_probability=mlm_probability,
+                    duplicate_prob=dup_prob,
+                    min_chunk_separation=min_chunk_separation
+                    if min_chunk_separation is not None
+                    else chunk_size,
+                    buffer_size=pair_cache_size,
+                    per_file_buffer=32,
+                    num_workers=num_workers,
+                    shuffle=True,
+                    cycle=True,
+                )
+            else:
+                train_dataloader = create_pair_dataloader(
+                    directory_path=data_dir,
+                    tokenizer=tokenizer,
+                    batch_size=base_config.batch_size,
+                    max_length=max_length,
+                    chunk_size=chunk_size,
+                    mlm_probability=mlm_probability,
+                    duplicate_prob=dup_prob,
+                    min_chunk_separation=min_chunk_separation
+                    if min_chunk_separation is not None
+                    else chunk_size,
+                    num_workers=num_workers,
+                    max_files=max_files,
+                    cache_size=pair_cache_size,
+                    prefetch_factor=prefetch_factor,
+                    tokenize_in_dataset=False,
+                )
+        else:
+            train_dataloader = create_dataloader(
+                directory_path=data_dir,
+                tokenizer=tokenizer,
+                batch_size=base_config.batch_size,
+                max_length=max_length,
+                chunk_size=chunk_size,
+                mlm_probability=mlm_probability,
+                num_workers=num_workers,
+                max_files=max_files,
+                streaming=streaming,
+            )
+        # len() not defined for streaming IterableDatasets
+        try:
+            num_batches = len(train_dataloader)
+            console.print(f"✓ Data loaded ({num_batches} batches)")
+        except TypeError:
+            console.print("✓ Data loaded (streaming)")
 
     # Create trainer
+    # Configure contrastive options on the config
+    if contrastive:
+        base_config.contrastive_enabled = True
+        base_config.pooling = pooling
+        base_config.contrastive_temperature = contrastive_temp
+        base_config.mlm_weight = mlm_weight
+        base_config.view_contrastive_weight = view_weight
+        base_config.same_file_contrastive_weight = samefile_weight
+        base_config.contrastive_ramp_steps = contrastive_ramp_steps
+        base_config.duplicate_pair_probability = dup_prob
+        base_config.min_chunk_separation = (
+            min_chunk_separation if min_chunk_separation is not None else chunk_size
+        )
+
     trainer = Trainer(
         model=model,
         tokenizer=tokenizer,

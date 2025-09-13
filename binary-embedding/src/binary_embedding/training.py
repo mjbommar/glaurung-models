@@ -26,6 +26,8 @@ from transformers import PreTrainedModel, get_linear_schedule_with_warmup
 from binary_embedding.models import BinaryEmbeddingConfig
 from binary_embedding.tokenizer import BinaryTokenizer
 
+from .losses import info_nce_pairwise, pool_embeddings, split_by_pair_type
+
 # Import WandB if available
 try:
     import wandb
@@ -121,6 +123,22 @@ class TrainerConfig:
     mixed_precision: bool = True
     gradient_checkpointing: bool = False
 
+    # Contrastive training options
+    contrastive_enabled: bool = False  # Enable dual-loss training
+    contrastive_temperature: float = 0.07
+    # Loss weights (can be ramped in during early steps)
+    mlm_weight: float = 1.0
+    view_contrastive_weight: float = 0.0  # duplicate-view pairs
+    same_file_contrastive_weight: float = 0.0  # different chunks in same file
+    contrastive_ramp_steps: int = (
+        0  # if >0, linearly scale contrastive weights up to step
+    )
+    # Pooling
+    pooling: str = "mean"  # 'mean' supported
+    # Pair sampling knobs (mirrors pair_data defaults; used for CLI display only)
+    duplicate_pair_probability: float = 0.5
+    min_chunk_separation: int | None = None
+
     @classmethod
     def from_model_size(cls, model_size: str, **kwargs):
         """Create config optimized for model size.
@@ -198,18 +216,73 @@ class Trainer:
         self.output_dir = Path(config.output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
+        # Enable memory-efficient attention kernels if available
+        try:
+            # PyTorch 2.0+
+            if hasattr(torch.backends, "cuda"):
+                if hasattr(torch.backends.cuda, "sdp_kernel"):
+                    # Newer API
+                    torch.backends.cuda.sdp_kernel(
+                        enable_flash=True, enable_mem_efficient=True, enable_math=False
+                    )
+                else:
+                    # Older API
+                    if hasattr(torch.backends.cuda, "enable_flash_sdp"):
+                        torch.backends.cuda.enable_flash_sdp(True)
+                    if hasattr(torch.backends.cuda, "enable_mem_efficient_sdp"):
+                        torch.backends.cuda.enable_mem_efficient_sdp(True)
+                    if hasattr(torch.backends.cuda, "enable_math_sdp"):
+                        torch.backends.cuda.enable_math_sdp(False)
+        except Exception:
+            pass
+
+        # Respect gradient checkpointing early (before Accelerator wrapping)
+        if config.gradient_checkpointing:
+            try:
+                if hasattr(self.model, "config"):
+                    # Disable cache for checkpointing compat
+                    try:
+                        self.model.config.use_cache = False
+                    except Exception:
+                        pass
+                if hasattr(self.model, "gradient_checkpointing_enable"):
+                    self.model.gradient_checkpointing_enable()
+                if hasattr(self.model, "enable_input_require_grads"):
+                    self.model.enable_input_require_grads()
+            except Exception:
+                pass
+
         # Initialize accelerator
         self.accelerator = Accelerator(
             mixed_precision="fp16" if config.mixed_precision else "no",
             gradient_accumulation_steps=config.gradient_accumulation_steps,
         )
 
-        # Calculate total steps
-        steps_per_epoch = len(train_dataloader) // config.gradient_accumulation_steps
+        # Calculate total steps and handle streaming dataloaders without __len__
+        self.is_streaming = False
+        try:
+            dl_len = len(train_dataloader)
+            steps_per_epoch = max(1, dl_len // config.gradient_accumulation_steps)
+        except TypeError:
+            self.is_streaming = True
+            steps_per_epoch = None
+
         if config.max_steps:
             self.total_steps = config.max_steps
+            # Virtual steps_per_epoch for progress display
+            if steps_per_epoch is None:
+                self.steps_per_epoch = max(
+                    1, self.total_steps // max(config.num_epochs, 1)
+                )
+            else:
+                self.steps_per_epoch = steps_per_epoch
         else:
+            if steps_per_epoch is None:
+                raise ValueError(
+                    "Streaming dataloader requires --max-steps to be set (no __len__)."
+                )
             self.total_steps = steps_per_epoch * config.num_epochs
+            self.steps_per_epoch = steps_per_epoch
 
         # Setup optimizer
         self.optimizer = self._setup_optimizer()
@@ -268,11 +341,12 @@ class Trainer:
         if self.val_dataloader:
             self.val_dataloader = self.accelerator.prepare(self.val_dataloader)
 
-        # Enable gradient checkpointing if requested
-        if config.gradient_checkpointing and hasattr(
-            self.model, "gradient_checkpointing_enable"
-        ):
-            self.model.gradient_checkpointing_enable()
+        # Post-prepare safety: ensure use_cache remains disabled if requested
+        if config.gradient_checkpointing and hasattr(self.model, "config"):
+            try:
+                self.model.config.use_cache = False
+            except Exception:
+                pass
 
         # Training state
         self.global_step = 0
@@ -376,11 +450,17 @@ class Trainer:
 
         # Calculate number of epochs needed
         # Note: steps_per_epoch should match the calculation used for total_steps
-        dataloader_len = len(self.train_dataloader)
-        steps_per_epoch = dataloader_len // self.config.gradient_accumulation_steps
-
-        # Debug info
-        console.print(f"[dim]Dataloader length: {dataloader_len} batches[/dim]")
+        try:
+            dataloader_len = len(self.train_dataloader)
+            steps_per_epoch = max(
+                1, dataloader_len // self.config.gradient_accumulation_steps
+            )
+            console.print(f"[dim]Dataloader length: {dataloader_len} batches[/dim]")
+        except TypeError:
+            # Streaming: use precomputed virtual steps_per_epoch for progress display
+            dataloader_len = None
+            steps_per_epoch = self.steps_per_epoch
+            console.print("[dim]Dataloader: streaming (no fixed length)[/dim]")
         console.print(
             f"[dim]Gradient accumulation steps: {self.config.gradient_accumulation_steps}[/dim]"
         )
@@ -388,8 +468,8 @@ class Trainer:
         # If num_epochs was specified in config, use that; otherwise calculate from total_steps
         if self.config.max_steps:
             num_epochs = (
-                self.total_steps + steps_per_epoch - 1
-            ) // steps_per_epoch  # Ceiling division
+                (self.total_steps + steps_per_epoch - 1) // steps_per_epoch
+            )  # Ceiling division (works for streaming via virtual steps)
         else:
             num_epochs = self.config.num_epochs
 
@@ -419,6 +499,10 @@ class Trainer:
             else:
                 epoch_loss = 0.0
                 epoch_steps = 0
+            # Component losses (running sums for averaged display)
+            epoch_mlm_loss = 0.0
+            epoch_view_ctr_loss = 0.0
+            epoch_samefile_ctr_loss = 0.0
 
             # Calculate how many steps to show for this epoch
             remaining_steps = self.total_steps - self.global_step
@@ -429,6 +513,9 @@ class Trainer:
                 BarColumn(),
                 MofNCompleteColumn(),
                 TextColumn("• Loss: {task.fields[loss]:.4f}"),
+                TextColumn("• MLM: {task.fields[mlm]:.4f}"),
+                TextColumn("• VCtr: {task.fields[vctr]:.4f}"),
+                TextColumn("• SFCtr: {task.fields[sfctr]:.4f}"),
                 TextColumn("• LR: {task.fields[lr]:.2e}"),
                 TimeElapsedColumn(),
                 TimeRemainingColumn(),
@@ -444,12 +531,17 @@ class Trainer:
 
                 # Progress bar tracks STEPS, not batches
                 # Initialize with current loss if resuming
-                initial_loss = epoch_loss / epoch_steps if epoch_steps > 0 else 0.0
+                initial_loss = (
+                    float(epoch_loss / epoch_steps) if epoch_steps > 0 else 0.0
+                )
                 task = progress.add_task(
                     "Training",
                     total=steps_this_epoch,
                     epoch=epoch,
                     loss=initial_loss,
+                    mlm=0.0,
+                    vctr=0.0,
+                    sfctr=0.0,
                     lr=current_lr,
                 )
 
@@ -483,14 +575,103 @@ class Trainer:
                         break
 
                     with self.accelerator.accumulate(self.model):
-                        # Forward pass
-                        outputs = self.model(
-                            input_ids=batch["input_ids"],
-                            attention_mask=batch["attention_mask"],
-                            labels=batch["labels"],
+                        # Defaults for component logging (torch scalars)
+                        log_mlm_t = torch.tensor(0.0, device=self.accelerator.device)
+                        log_view_t = torch.tensor(0.0, device=self.accelerator.device)
+                        log_sf_t = torch.tensor(0.0, device=self.accelerator.device)
+                        # Determine if batch contains contrastive pairs
+                        is_pair_batch = (
+                            self.config.contrastive_enabled
+                            and isinstance(batch, dict)
+                            and "pair_types" in batch
+                            and batch["input_ids"].dim() == 3
                         )
 
-                        loss = outputs.loss
+                        if is_pair_batch:
+                            # Flatten [B, 2, L] -> [2B, L]
+                            bsz, views, seqlen = batch["input_ids"].shape
+                            input_ids = batch["input_ids"].view(bsz * views, seqlen)
+                            attention_mask = batch["attention_mask"].view(
+                                bsz * views, seqlen
+                            )
+                            labels = batch["labels"].view(bsz * views, seqlen)
+
+                            outputs = self.model(
+                                input_ids=input_ids,
+                                attention_mask=attention_mask,
+                                labels=labels,
+                                output_hidden_states=True,
+                                return_dict=True,
+                            )
+
+                            mlm_loss = outputs.loss
+
+                            # Embeddings via mean pooling
+                            last_hidden = outputs.hidden_states[-1]
+                            emb = pool_embeddings(
+                                last_hidden,
+                                attention_mask,
+                                method=self.config.pooling,
+                            )
+                            emb = emb.view(bsz, views, -1)
+
+                            # Contrastive subsets
+                            pair_types = batch["pair_types"].to(emb.device)
+                            dup_a, dup_b, sf_a, sf_b = split_by_pair_type(
+                                emb, pair_types
+                            )
+
+                            view_loss = (
+                                info_nce_pairwise(
+                                    dup_a, dup_b, self.config.contrastive_temperature
+                                )
+                                if dup_a.size(0) > 0
+                                else mlm_loss.new_tensor(0.0)
+                            )
+                            same_file_loss = (
+                                info_nce_pairwise(
+                                    sf_a, sf_b, self.config.contrastive_temperature
+                                )
+                                if sf_a.size(0) > 0
+                                else mlm_loss.new_tensor(0.0)
+                            )
+
+                            # Linear ramp for contrastive weights
+                            if (
+                                self.config.contrastive_ramp_steps
+                                and self.config.contrastive_ramp_steps > 0
+                            ):
+                                ramp = min(
+                                    1.0,
+                                    self.global_step
+                                    / float(self.config.contrastive_ramp_steps),
+                                )
+                            else:
+                                ramp = 1.0
+
+                            mlm_w = self.config.mlm_weight
+                            view_w = self.config.view_contrastive_weight * ramp
+                            sf_w = self.config.same_file_contrastive_weight * ramp
+
+                            total_loss = (
+                                mlm_w * mlm_loss
+                                + view_w * view_loss
+                                + sf_w * same_file_loss
+                            )
+                            loss = total_loss
+                            # Record components for display
+                            log_mlm_t = mlm_loss.detach().float()
+                            log_view_t = view_loss.detach().float()
+                            log_sf_t = same_file_loss.detach().float()
+                        else:
+                            # Standard MLM batch
+                            outputs = self.model(
+                                input_ids=batch["input_ids"],
+                                attention_mask=batch["attention_mask"],
+                                labels=batch["labels"],
+                            )
+                            loss = outputs.loss
+                            log_mlm_t = loss.detach().float()
 
                         # Backward pass
                         self.accelerator.backward(loss)
@@ -506,7 +687,8 @@ class Trainer:
                             # Optimizer step
                             self.optimizer.step()
                             self.scheduler.step()
-                            self.optimizer.zero_grad()
+                            # Use set_to_none to reduce VRAM and improve perf
+                            self.optimizer.zero_grad(set_to_none=True)
                         else:
                             grad_norm = 0.0
 
@@ -520,11 +702,21 @@ class Trainer:
 
                         # Update progress bar (once per step, not per batch)
                         current_loss = epoch_loss / epoch_steps
+                        # Update component running averages
+                        epoch_mlm_loss += log_mlm_t
+                        epoch_view_ctr_loss += log_view_t
+                        epoch_samefile_ctr_loss += log_sf_t
+                        current_mlm = epoch_mlm_loss / epoch_steps
+                        current_vctr = epoch_view_ctr_loss / epoch_steps
+                        current_sfctr = epoch_samefile_ctr_loss / epoch_steps
                         current_lr = self.scheduler.get_last_lr()[0]
                         progress.update(
                             task,
                             advance=1,
-                            loss=current_loss,
+                            loss=float(current_loss),
+                            mlm=float(current_mlm),
+                            vctr=float(current_vctr),
+                            sfctr=float(current_sfctr),
                             lr=current_lr,
                         )
 
@@ -552,6 +744,61 @@ class Trainer:
                                 }
                                 if self.accelerator.sync_gradients:
                                     wandb_log["train/gradient_norm"] = float(grad_norm)
+
+                                # Add per-loss components if available
+                                # Defaults are zero when running pure-MLM batches
+                                try:
+                                    mlm_step = float(log_mlm_t)
+                                except Exception:
+                                    mlm_step = 0.0
+                                try:
+                                    view_step = float(log_view_t)
+                                except Exception:
+                                    view_step = 0.0
+                                try:
+                                    sf_step = float(log_sf_t)
+                                except Exception:
+                                    sf_step = 0.0
+
+                                wandb_log.update(
+                                    {
+                                        "train/mlm_loss": mlm_step,
+                                        "train/view_contrastive_loss": view_step,
+                                        "train/same_file_contrastive_loss": sf_step,
+                                    }
+                                )
+
+                                # Effective weights (with ramp applied) for transparency
+                                if (
+                                    self.config.contrastive_ramp_steps
+                                    and self.config.contrastive_ramp_steps > 0
+                                ):
+                                    ramp = min(
+                                        1.0,
+                                        self.global_step
+                                        / float(self.config.contrastive_ramp_steps),
+                                    )
+                                else:
+                                    ramp = 1.0
+
+                                eff_view_w = self.config.view_contrastive_weight * ramp
+                                eff_sf_w = (
+                                    self.config.same_file_contrastive_weight * ramp
+                                )
+
+                                wandb_log.update(
+                                    {
+                                        "train/mlm_weight": float(
+                                            self.config.mlm_weight
+                                        ),
+                                        "train/view_contrastive_weight": float(
+                                            eff_view_w
+                                        ),
+                                        "train/same_file_contrastive_weight": float(
+                                            eff_sf_w
+                                        ),
+                                    }
+                                )
 
                                 wandb.log(wandb_log, step=self.global_step)
 
@@ -883,6 +1130,12 @@ class Trainer:
             return
 
         # Prepare config for logging
+        # Try to fetch dataloader length if available
+        try:
+            dl_length = len(self.train_dataloader)
+        except TypeError:
+            dl_length = None
+
         wandb_config = {
             # Model configuration
             "model_type": self.model_config.model_type
@@ -924,7 +1177,8 @@ class Trainer:
             "mixed_precision": self.config.mixed_precision,
             "gradient_checkpointing": self.config.gradient_checkpointing,
             # Dataset info
-            "dataloader_length": len(self.train_dataloader),
+            "dataloader_length": dl_length,
+            "dataloader_streaming": self.is_streaming,
             "total_steps": self.total_steps,
             # Assessment configuration
             "run_assessment": self.config.run_assessment,
