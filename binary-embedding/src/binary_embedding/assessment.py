@@ -207,7 +207,9 @@ class BinaryAssessment:
 
             # Tokenize with add_special_tokens=True to get boundary tokens
             # just like in training
-            encoding = self.tokenizer.tokenizer.encode(full_sequence, add_special_tokens=True)
+            encoding = self.tokenizer.tokenizer.encode(
+                full_sequence, add_special_tokens=True
+            )
             token_ids = encoding.ids
 
             # Find maskable positions (skip start/end tokens)
