@@ -205,14 +205,17 @@ class BinaryAssessment:
             # Get full sequence with context
             full_sequence = header.to_latin1_string()
 
-            # Tokenize to get structure
-            encoding = self.tokenizer.tokenizer.encode(full_sequence)
+            # Tokenize with add_special_tokens=True to get boundary tokens
+            # just like in training
+            encoding = self.tokenizer.tokenizer.encode(full_sequence, add_special_tokens=True)
             token_ids = encoding.ids
 
             # Find maskable positions (skip start/end tokens)
+            # Start token is at position 0, end token is at last position
+            # So we mask positions 1 to len-2
             maskable_positions = list(
                 range(1, min(len(token_ids) - 1, 6))
-            )  # Test first 5 content tokens
+            )  # Test first 5 content tokens after <|start|>
 
             for mask_pos in maskable_positions:
                 original_token_id = token_ids[mask_pos]

@@ -22,11 +22,14 @@ class BinaryTokenizer:
         self.vocab_size: int = self.tokenizer.get_vocab_size()
 
         # Get special token IDs
-        self.pad_token_id: int = self.tokenizer.token_to_id("<|pad|>") or 0
-        self.unk_token_id: int = self.tokenizer.token_to_id("<|unk|>") or 1
-        self.cls_token_id: int = self.tokenizer.token_to_id("<|cls|>") or 2
-        self.sep_token_id: int = self.tokenizer.token_to_id("<|sep|>") or 3
-        self.mask_token_id: int = self.tokenizer.token_to_id("<|mask|>") or 4
+        # Note: The tokenizer has <|start|> at 0 and <|end|> at 1
+        self.start_token_id: int = self.tokenizer.token_to_id("<|start|>")
+        self.end_token_id: int = self.tokenizer.token_to_id("<|end|>")
+        self.sep_token_id: int = self.tokenizer.token_to_id("<|sep|>")
+        self.cls_token_id: int = self.tokenizer.token_to_id("<|cls|>")
+        self.pad_token_id: int = self.tokenizer.token_to_id("<|pad|>")
+        self.mask_token_id: int = self.tokenizer.token_to_id("<|mask|>")
+        self.unk_token_id: int = self.tokenizer.token_to_id("<|unk|>")
 
         # Store special tokens
         self.special_tokens: dict[str, str] = {
@@ -35,6 +38,8 @@ class BinaryTokenizer:
             "cls_token": "<|cls|>",
             "sep_token": "<|sep|>",
             "mask_token": "<|mask|>",
+            "start_token": "<|start|>",
+            "end_token": "<|end|>",
         }
 
     def encode(

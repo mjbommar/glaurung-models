@@ -69,6 +69,7 @@ class BinaryDataset(Dataset):
 
         # Pre-compute chunks for all files
         self.chunks: list[str] = []
+        self.use_file_boundaries = True  # Flag to add <|start|> and <|end|> tokens
         for file_path in self.file_paths:
             self._load_file_chunks(file_path)
 
@@ -80,17 +81,31 @@ class BinaryDataset(Dataset):
         """
         try:
             with open(file_path, "rb") as f:
-                while True:
-                    chunk = f.read(self.chunk_size)
-                    if not chunk:
-                        break
-
-                    # Convert bytes to latin-1 string
-                    # This preserves each byte as a character (0-255 -> char)
-                    # This is how the tokenizer was originally trained
-                    latin1_string = chunk.decode("latin-1")
-
+                # Read entire file content
+                file_content = f.read()
+                if not file_content:
+                    return
+                    
+                # Convert entire file to latin-1 string
+                latin1_string = file_content.decode("latin-1")
+                
+                # The tokenizer automatically adds <|start|> and <|end|> tokens
+                # when add_special_tokens=True is used, so we just need to
+                # ensure each chunk represents a complete file
+                
+                # If file is small enough, keep it as one chunk
+                if len(latin1_string) <= self.chunk_size:
                     self.chunks.append(latin1_string)
+                else:
+                    # For larger files, split into chunks
+                    # Each chunk will get start/end tokens from the tokenizer
+                    # This treats each chunk as a separate "file"
+                    remaining = latin1_string
+                    
+                    while remaining:
+                        chunk_content = remaining[:self.chunk_size]
+                        remaining = remaining[self.chunk_size:]
+                        self.chunks.append(chunk_content)
 
         except Exception:
             pass  # Skip files that can't be read
@@ -182,7 +197,14 @@ class MLMDataCollator:
         probability_matrix = torch.full(labels.shape, self.mlm_probability)
 
         # Don't mask special tokens or padding
-        special_tokens_mask = labels == self.pad_token_id
+        # Include all special tokens: pad, start, end, cls, sep, mask
+        special_tokens_mask = (
+            (labels == self.pad_token_id) |
+            (labels == self.tokenizer.start_token_id) |
+            (labels == self.tokenizer.end_token_id) |
+            (labels == self.tokenizer.cls_token_id) |
+            (labels == self.tokenizer.sep_token_id)
+        )
 
         probability_matrix.masked_fill_(special_tokens_mask, value=0.0)
 
