@@ -9,6 +9,7 @@ from typing import Any
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from accelerate import Accelerator
 from rich.console import Console
 from rich.progress import (
@@ -252,9 +253,9 @@ class Trainer:
             except Exception:
                 pass
 
-        # Initialize accelerator
+        # Initialize accelerator (default to BF16 when mixed precision is enabled)
         self.accelerator = Accelerator(
-            mixed_precision="fp16" if config.mixed_precision else "no",
+            mixed_precision="bf16" if config.mixed_precision else "no",
             gradient_accumulation_steps=config.gradient_accumulation_steps,
         )
 
@@ -596,18 +597,57 @@ class Trainer:
                             )
                             labels = batch["labels"].view(bsz * views, seqlen)
 
-                            outputs = self.model(
-                                input_ids=input_ids,
-                                attention_mask=attention_mask,
-                                labels=labels,
-                                output_hidden_states=True,
-                                return_dict=True,
-                            )
+                            # Memory-safe forward: compute last_hidden + MLM loss without returning logits
+                            # Use backbone (roberta/bert) directly to avoid Accelerate upcasting huge logits
+                            with self.accelerator.autocast():
+                                # Identify backbone and MLM head
+                                if hasattr(self.model, "roberta"):
+                                    backbone = self.model.roberta
+                                elif hasattr(self.model, "bert"):
+                                    backbone = self.model.bert
+                                else:
+                                    backbone = None
 
-                            mlm_loss = outputs.loss
+                                if hasattr(self.model, "lm_head"):
+                                    mlm_head = self.model.lm_head
+                                elif hasattr(self.model, "cls"):
+                                    mlm_head = self.model.cls
+                                else:
+                                    mlm_head = None
 
-                            # Embeddings via mean pooling
-                            last_hidden = outputs.hidden_states[-1]
+                                if backbone is not None and mlm_head is not None:
+                                    base_out = backbone(
+                                        input_ids=input_ids,
+                                        attention_mask=attention_mask,
+                                        return_dict=True,
+                                    )
+                                    last_hidden = base_out.last_hidden_state
+                                    prediction_scores = mlm_head(last_hidden)
+                                    vocab_size = prediction_scores.size(-1)
+                                    mlm_loss = F.cross_entropy(
+                                        prediction_scores.view(-1, vocab_size),
+                                        labels.view(-1),
+                                        ignore_index=-100,
+                                    )
+                                else:
+                                    # Fallback to standard forward if unexpected model type
+                                    outputs = self.model(
+                                        input_ids=input_ids,
+                                        attention_mask=attention_mask,
+                                        labels=labels,
+                                        return_dict=True,
+                                    )
+                                    mlm_loss = outputs.loss
+                                    if hasattr(outputs, "last_hidden_state"):
+                                        last_hidden = outputs.last_hidden_state
+                                    else:
+                                        outputs_h = self.model(
+                                            input_ids=input_ids,
+                                            attention_mask=attention_mask,
+                                            return_dict=True,
+                                            output_hidden_states=True,
+                                        )
+                                        last_hidden = outputs_h.hidden_states[-1]
                             emb = pool_embeddings(
                                 last_hidden,
                                 attention_mask,
@@ -664,13 +704,48 @@ class Trainer:
                             log_view_t = view_loss.detach().float()
                             log_sf_t = same_file_loss.detach().float()
                         else:
-                            # Standard MLM batch
-                            outputs = self.model(
-                                input_ids=batch["input_ids"],
-                                attention_mask=batch["attention_mask"],
-                                labels=batch["labels"],
-                            )
-                            loss = outputs.loss
+                            # Standard MLM batch (no contrastive). Compute loss without returning logits.
+                            in_ids = batch["input_ids"]
+                            attn = batch["attention_mask"]
+                            lbls = batch["labels"]
+
+                            with self.accelerator.autocast():
+                                if hasattr(self.model, "roberta"):
+                                    backbone = self.model.roberta
+                                elif hasattr(self.model, "bert"):
+                                    backbone = self.model.bert
+                                else:
+                                    backbone = None
+
+                                if hasattr(self.model, "lm_head"):
+                                    mlm_head = self.model.lm_head
+                                elif hasattr(self.model, "cls"):
+                                    mlm_head = self.model.cls
+                                else:
+                                    mlm_head = None
+
+                                if backbone is not None and mlm_head is not None:
+                                    base_out = backbone(
+                                        input_ids=in_ids,
+                                        attention_mask=attn,
+                                        return_dict=True,
+                                    )
+                                    last_hidden = base_out.last_hidden_state
+                                    prediction_scores = mlm_head(last_hidden)
+                                    vocab_size = prediction_scores.size(-1)
+                                    loss = F.cross_entropy(
+                                        prediction_scores.view(-1, vocab_size),
+                                        lbls.view(-1),
+                                        ignore_index=-100,
+                                    )
+                                else:
+                                    outputs = self.model(
+                                        input_ids=in_ids,
+                                        attention_mask=attn,
+                                        labels=lbls,
+                                        return_dict=True,
+                                    )
+                                    loss = outputs.loss
                             log_mlm_t = loss.detach().float()
 
                         # Backward pass
