@@ -434,6 +434,8 @@ class BinaryAssessment:
                 summed = torch.sum(masked_hidden, dim=1)
                 count = torch.clamp(mask.sum(dim=1), min=1e-9)
                 embedding = summed / count
+                # L2 normalize to match training
+                embedding = torch.nn.functional.normalize(embedding, p=2, dim=-1)
 
             return embedding[0]
 
