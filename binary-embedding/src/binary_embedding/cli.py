@@ -12,6 +12,7 @@ from rich.table import Table
 
 from binary_embedding.assessment import load_and_assess_model
 from binary_embedding.data import create_dataloader
+from binary_embedding.entropy import EntropyFilter
 from binary_embedding.models import ModelSize, create_model
 from binary_embedding.pair_data import (
     create_pair_dataloader,
@@ -150,6 +151,36 @@ def cli() -> None:
     type=int,
     default=None,
     help="Gradient accumulation steps (auto-selected based on model size if not specified)",
+)
+@click.option(
+    "--max-grad-norm",
+    type=float,
+    default=1.0,
+    help="Maximum gradient norm for clipping (default: 1.0)",
+)
+@click.option(
+    "--use-adaptive-grad-clip",
+    is_flag=True,
+    default=False,
+    help="Use adaptive gradient clipping based on percentile of recent gradients",
+)
+@click.option(
+    "--grad-clip-percentile",
+    type=float,
+    default=95.0,
+    help="Percentile of recent gradients to use for clipping (default: 95.0)",
+)
+@click.option(
+    "--grad-clip-history-size",
+    type=int,
+    default=100,
+    help="Number of steps to track for gradient percentile (default: 100)",
+)
+@click.option(
+    "--grad-clip-initial-threshold",
+    type=float,
+    default=10.0,
+    help="Initial gradient clipping threshold for first N steps (default: 10.0)",
 )
 @click.option(
     "--early-stopping/--no-early-stopping",
@@ -307,6 +338,24 @@ def cli() -> None:
     default=0,
     help="Linear ramp-in steps for contrastive loss weights",
 )
+@click.option(
+    "--enable-entropy-filtering",
+    is_flag=True,
+    default=False,
+    help="Enable entropy-based chunk filtering",
+)
+@click.option(
+    "--entropy-bins",
+    type=str,
+    default="0,1.0,3.0,6.0,7.5,8.0",
+    help="Comma-separated entropy bin thresholds",
+)
+@click.option(
+    "--entropy-weights",
+    type=str,
+    default="0.1,0.5,2.0,1.0,0.3",
+    help="Comma-separated sampling weights for each entropy bin",
+)
 def train(
     model_size: str,
     model_type: str,
@@ -328,6 +377,11 @@ def train(
     mixed_precision: bool,
     gradient_checkpointing: bool,
     gradient_accumulation_steps: int | None,
+    max_grad_norm: float,
+    use_adaptive_grad_clip: bool,
+    grad_clip_percentile: float,
+    grad_clip_history_size: int,
+    grad_clip_initial_threshold: float,
     early_stopping: bool,
     monitor_embedding: bool,
     save_steps: int,
@@ -355,6 +409,9 @@ def train(
     view_weight: float,
     samefile_weight: float,
     contrastive_ramp_steps: int,
+    enable_entropy_filtering: bool,
+    entropy_bins: str,
+    entropy_weights: str,
 ) -> None:
     """Train a binary embedding model with optional advanced features."""
     # Display configuration
@@ -400,6 +457,11 @@ def train(
         base_config.gradient_accumulation_steps = gradient_accumulation_steps
     if scheduler_type is not None:
         base_config.scheduler_type = scheduler_type
+    base_config.max_grad_norm = max_grad_norm
+    base_config.use_adaptive_grad_clip = use_adaptive_grad_clip
+    base_config.grad_clip_percentile = grad_clip_percentile
+    base_config.grad_clip_history_size = grad_clip_history_size
+    base_config.grad_clip_initial_threshold = grad_clip_initial_threshold
     if warmup_steps is not None:
         base_config.warmup_steps = warmup_steps
     if gradient_checkpointing:
@@ -422,6 +484,10 @@ def train(
         str(base_config.batch_size * base_config.gradient_accumulation_steps),
     )
     config_table.add_row("Learning Rate", f"{base_config.learning_rate:.2e}")
+    if use_adaptive_grad_clip:
+        config_table.add_row("Adaptive Grad Clip", f"✓ ({grad_clip_percentile:.0f}%ile)")
+    else:
+        config_table.add_row("Max Grad Norm", f"{max_grad_norm:.1f}")
     config_table.add_row("Scheduler", base_config.scheduler_type)
     config_table.add_row(
         "Warmup",
@@ -457,6 +523,8 @@ def train(
             "Loss Weights",
             f"MLM={mlm_weight}, View={view_weight}, SameFile={samefile_weight}",
         )
+    if enable_entropy_filtering:
+        config_table.add_row("Entropy Filtering", "✓")
 
     console.print(config_table)
     console.print()
@@ -515,6 +583,17 @@ def train(
             total_params = sum(p.numel() for p in model.parameters())
             console.print(f"✓ Model created ({total_params:,} parameters)")
 
+    # Create entropy filter if enabled
+    entropy_filter = None
+    if enable_entropy_filtering:
+        # Parse entropy bins and weights from comma-separated strings
+        bins = [float(x.strip()) for x in entropy_bins.split(',')]
+        weights = [float(x.strip()) for x in entropy_weights.split(',')]
+        entropy_filter = EntropyFilter(entropy_bins=bins, sampling_weights=weights)
+        console.print(f"[yellow]Entropy filtering enabled[/yellow]")
+        console.print(f"  Bins: {bins}")
+        console.print(f"  Weights: {weights}")
+
     # Create data loader
     with console.status(f"[bold green]Loading data from {data_dir}..."):
         if contrastive:
@@ -535,6 +614,8 @@ def train(
                     num_workers=num_workers,
                     shuffle=True,
                     cycle=True,
+                    enable_entropy_filtering=enable_entropy_filtering,
+                    entropy_filter=entropy_filter,
                 )
             else:
                 train_dataloader = create_pair_dataloader(
@@ -553,6 +634,8 @@ def train(
                     cache_size=pair_cache_size,
                     prefetch_factor=prefetch_factor,
                     tokenize_in_dataset=False,
+                    enable_entropy_filtering=enable_entropy_filtering,
+                    entropy_filter=entropy_filter,
                 )
         else:
             train_dataloader = create_dataloader(
@@ -565,6 +648,8 @@ def train(
                 num_workers=num_workers,
                 max_files=max_files,
                 streaming=streaming,
+                enable_entropy_filtering=enable_entropy_filtering,
+                entropy_filter=entropy_filter,
             )
         # len() not defined for streaming IterableDatasets
         try:

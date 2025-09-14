@@ -18,12 +18,13 @@ import threading
 from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 import torch
 from torch.utils.data import DataLoader, Dataset, IterableDataset
 
 from .tokenizer import BinaryTokenizer
+from .entropy import EntropyFilter
 
 
 class SameFilePairDataset(Dataset):
@@ -51,6 +52,8 @@ class SameFilePairDataset(Dataset):
         max_files: int | None = None,
         file_extensions: list[str] | None = None,
         tokenize_in_dataset: bool = False,
+        entropy_filter: Optional[EntropyFilter] = None,
+        enable_entropy_filtering: bool = False,
     ) -> None:
         self.directory_path = Path(directory_path)
         self.tokenizer = tokenizer
@@ -62,6 +65,8 @@ class SameFilePairDataset(Dataset):
         )
         self.cache_size = cache_size
         self.tokenize_in_dataset = tokenize_in_dataset
+        self.enable_entropy_filtering = enable_entropy_filtering
+        self.entropy_filter = entropy_filter or EntropyFilter()
 
         # Collect all files
         self.file_paths = self._collect_files(file_extensions, max_files)
@@ -186,6 +191,40 @@ class SameFilePairDataset(Dataset):
             else:
                 idx1 = i
                 idx2 = random.choice(candidates)
+
+        # Apply entropy filtering if enabled
+        if self.enable_entropy_filtering:
+            # Check if we should sample based on entropy of first chunk
+            file_idx1, offset1 = self.index[idx1]
+            file_path1 = self.file_paths[file_idx1]
+            try:
+                with open(file_path1, "rb") as f:
+                    f.seek(offset1)
+                    raw_chunk1 = f.read(self.chunk_size)
+                    if raw_chunk1:
+                        # Probabilistically skip based on entropy
+                        if not self.entropy_filter.should_sample(raw_chunk1, random.random()):
+                            # Return empty/padding data for filtered chunks
+                            if self.tokenize_in_dataset:
+                                zero_enc = {
+                                    "input_ids": torch.zeros(self.max_length, dtype=torch.long),
+                                    "attention_mask": torch.zeros(self.max_length, dtype=torch.long),
+                                }
+                                return {
+                                    "input_ids_1": zero_enc["input_ids"],
+                                    "attention_mask_1": zero_enc["attention_mask"],
+                                    "input_ids_2": zero_enc["input_ids"],
+                                    "attention_mask_2": zero_enc["attention_mask"],
+                                    "pair_type": 0,
+                                }
+                            else:
+                                return {
+                                    "text_1": "",
+                                    "text_2": "",
+                                    "pair_type": 0,
+                                }
+            except Exception:
+                pass
 
         # Load both views (masking applied later in collator)
         s1 = self._load_chunk(idx1)
@@ -359,6 +398,8 @@ def create_pair_dataloader(
     cache_size: int = 4096,
     prefetch_factor: int | None = 4,
     tokenize_in_dataset: bool = False,
+    enable_entropy_filtering: bool = False,
+    entropy_filter: Optional[EntropyFilter] = None,
     **kwargs: Any,
 ) -> DataLoader:
     """Create a DataLoader that yields same-file pairs with MLM labels.
@@ -375,6 +416,8 @@ def create_pair_dataloader(
         cache_size=cache_size,
         max_files=max_files,
         tokenize_in_dataset=tokenize_in_dataset,
+        enable_entropy_filtering=enable_entropy_filtering,
+        entropy_filter=entropy_filter,
         **kwargs,
     )
 
@@ -421,6 +464,8 @@ class StreamingSameFilePairDataset(IterableDataset):
         per_file_buffer: int = 32,
         shuffle: bool = True,
         cycle: bool = True,
+        entropy_filter: Optional[EntropyFilter] = None,
+        enable_entropy_filtering: bool = False,
     ) -> None:
         self.directory_path = Path(directory_path)
         self.tokenizer = tokenizer
@@ -435,6 +480,8 @@ class StreamingSameFilePairDataset(IterableDataset):
         self.per_file_buffer = per_file_buffer
         self.shuffle = shuffle
         self.cycle = cycle
+        self.enable_entropy_filtering = enable_entropy_filtering
+        self.entropy_filter = entropy_filter or EntropyFilter()
 
         # Collect file paths
         self.file_paths: list[Path] = []
@@ -464,6 +511,13 @@ class StreamingSameFilePairDataset(IterableDataset):
                         chunk = f.read(self.chunk_size)
                         if not chunk:
                             break
+                        
+                        # Apply entropy filtering if enabled
+                        if self.enable_entropy_filtering:
+                            if not self.entropy_filter.should_sample(chunk, random.random()):
+                                offset += self.chunk_size
+                                continue  # Skip this chunk
+                        
                         try:
                             text = chunk.decode("latin-1", errors="replace")
                         except Exception:
@@ -578,6 +632,8 @@ def create_streaming_pair_dataloader(
     num_workers: int = 4,
     shuffle: bool = True,
     cycle: bool = True,
+    enable_entropy_filtering: bool = False,
+    entropy_filter: Optional[EntropyFilter] = None,
 ) -> DataLoader:
     """Create a streaming DataLoader that yields pairs continuously.
 
@@ -595,6 +651,8 @@ def create_streaming_pair_dataloader(
         per_file_buffer=per_file_buffer,
         shuffle=shuffle,
         cycle=cycle,
+        enable_entropy_filtering=enable_entropy_filtering,
+        entropy_filter=entropy_filter,
     )
 
     collator = ContrastiveMLMCollator(

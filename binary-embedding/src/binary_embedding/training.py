@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import json
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -70,6 +72,12 @@ class TrainerConfig:
     adam_beta2: float = 0.999
     adam_epsilon: float = 1e-8
     max_grad_norm: float = 1.0
+    
+    # Adaptive gradient clipping
+    use_adaptive_grad_clip: bool = False
+    grad_clip_percentile: float = 95.0  # Use 95th percentile of recent gradients
+    grad_clip_history_size: int = 100  # Number of steps to track
+    grad_clip_initial_threshold: float = 10.0  # Initial threshold for first 100 steps
 
     # Training duration
     num_epochs: int = 3
@@ -353,6 +361,9 @@ class Trainer:
         self.global_step = 0
         self.best_val_loss = float("inf")
         self.training_history: list[dict[str, Any]] = []
+        
+        # Gradient norm tracking for adaptive clipping
+        self.grad_norm_history: deque[float] = deque(maxlen=config.grad_clip_history_size)
         self.starting_epoch = 0
 
         # Initialize WandB if enabled
@@ -754,10 +765,49 @@ class Trainer:
                         # Only do optimizer step when gradients are synchronized
                         if self.accelerator.sync_gradients:
                             # Gradient clipping
-                            grad_norm = self.accelerator.clip_grad_norm_(
-                                self.model.parameters(),
-                                self.config.max_grad_norm,
-                            )
+                            if self.config.use_adaptive_grad_clip:
+                                # Calculate current gradient norm
+                                total_norm = 0.0
+                                for p in self.model.parameters():
+                                    if p.grad is not None:
+                                        param_norm = p.grad.data.norm(2)
+                                        total_norm += param_norm.item() ** 2
+                                current_grad_norm = total_norm ** 0.5
+                                
+                                # Determine clipping threshold
+                                if self.global_step < self.config.grad_clip_history_size:
+                                    # Use initial threshold for first N steps
+                                    clip_threshold = self.config.grad_clip_initial_threshold
+                                else:
+                                    # Use percentile of recent gradient norms
+                                    if len(self.grad_norm_history) > 0:
+                                        clip_threshold = np.percentile(
+                                            list(self.grad_norm_history), 
+                                            self.config.grad_clip_percentile
+                                        )
+                                        # Ensure we don't go below a minimum threshold
+                                        clip_threshold = max(clip_threshold, 1.0)
+                                    else:
+                                        clip_threshold = self.config.grad_clip_initial_threshold
+                                
+                                # Apply gradient clipping with adaptive threshold
+                                grad_norm = self.accelerator.clip_grad_norm_(
+                                    self.model.parameters(),
+                                    clip_threshold,
+                                )
+                                
+                                # Track gradient norm for future percentile calculation
+                                self.grad_norm_history.append(current_grad_norm)
+                                
+                                # Store threshold for logging
+                                adaptive_clip_threshold = clip_threshold
+                            else:
+                                # Standard gradient clipping
+                                grad_norm = self.accelerator.clip_grad_norm_(
+                                    self.model.parameters(),
+                                    self.config.max_grad_norm,
+                                )
+                                adaptive_clip_threshold = self.config.max_grad_norm
 
                             # Optimizer step
                             self.optimizer.step()
@@ -766,6 +816,7 @@ class Trainer:
                             self.optimizer.zero_grad(set_to_none=True)
                         else:
                             grad_norm = 0.0
+                            adaptive_clip_threshold = 0.0
 
                     # Only update metrics and progress on actual optimizer steps
                     # (not on every batch during gradient accumulation)
@@ -801,6 +852,8 @@ class Trainer:
                                 "step": self.global_step,
                                 "epoch": epoch,
                                 "loss": float(current_loss),
+                                "grad_norm": float(grad_norm),
+                                "grad_clip_threshold": float(adaptive_clip_threshold),
                                 "learning_rate": float(current_lr),
                             }
 
@@ -1175,10 +1228,19 @@ class Trainer:
                 )
 
             # Calculate starting epoch based on global_step
-            steps_per_epoch = (
-                len(self.train_dataloader) // self.config.gradient_accumulation_steps
-            )
-            self.starting_epoch = self.global_step // steps_per_epoch
+            # For streaming datasets, we can't get the length, so estimate or skip
+            try:
+                steps_per_epoch = (
+                    len(self.train_dataloader) // self.config.gradient_accumulation_steps
+                )
+                self.starting_epoch = self.global_step // steps_per_epoch
+            except TypeError:
+                # Streaming dataset doesn't have length, estimate based on global_step
+                # Assume a reasonable default or use config if available
+                self.starting_epoch = 0  # Will be updated during training
+                console.print(
+                    "[yellow]  Note: Using streaming dataset, epoch tracking approximate[/yellow]"
+                )
 
             console.print(
                 f"[green]✓ Resumed from checkpoint at step {self.global_step}[/green]"

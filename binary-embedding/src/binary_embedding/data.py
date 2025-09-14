@@ -19,11 +19,13 @@ import threading
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from typing import Optional
 
 import torch
 from torch.utils.data import DataLoader, Dataset, IterableDataset
 
 from binary_embedding.tokenizer import BinaryTokenizer
+from binary_embedding.entropy import EntropyFilter
 
 
 class BinaryDataset(Dataset):
@@ -44,6 +46,8 @@ class BinaryDataset(Dataset):
         max_files: int | None = None,
         file_extensions: list[str] | None = None,
         cache_size: int = 1000,
+        entropy_filter: Optional[EntropyFilter] = None,
+        enable_entropy_filtering: bool = False,
     ) -> None:
         """Initialize the dataset.
 
@@ -55,12 +59,16 @@ class BinaryDataset(Dataset):
             max_files: Maximum number of files to load (None for all).
             file_extensions: List of file extensions to include (None for all).
             cache_size: Number of chunks to cache in memory.
+            entropy_filter: EntropyFilter instance for filtering chunks.
+            enable_entropy_filtering: Whether to enable entropy-based filtering.
         """
         self.directory_path = Path(directory_path)
         self.tokenizer = tokenizer
         self.max_length = max_length
         self.chunk_size = chunk_size
         self.cache_size = cache_size
+        self.enable_entropy_filtering = enable_entropy_filtering
+        self.entropy_filter = entropy_filter or EntropyFilter()
 
         # Collect all binary files
         self.file_paths = self._collect_files(file_extensions, max_files)
@@ -173,6 +181,26 @@ class BinaryDataset(Dataset):
                 "attention_mask": torch.zeros(self.max_length, dtype=torch.long),
             }
 
+        # Apply entropy filtering if enabled
+        if self.enable_entropy_filtering:
+            # Get the raw bytes for entropy calculation
+            file_idx, offset = self.index[idx]
+            file_path = self.file_paths[file_idx]
+            try:
+                with open(file_path, "rb") as f:
+                    f.seek(offset)
+                    raw_chunk = f.read(self.chunk_size)
+                    if raw_chunk:
+                        # Probabilistically skip based on entropy
+                        if not self.entropy_filter.should_sample(raw_chunk, random.random()):
+                            # Return padding for filtered chunks
+                            return {
+                                "input_ids": torch.zeros(self.max_length, dtype=torch.long),
+                                "attention_mask": torch.zeros(self.max_length, dtype=torch.long),
+                            }
+            except Exception:
+                pass
+
         # Tokenize (tokenizer adds <|start|> and <|end|> automatically)
         encoding = self.tokenizer(
             chunk,
@@ -204,6 +232,8 @@ class StreamingBinaryDataset(IterableDataset):
         num_workers: int = 4,
         shuffle: bool = True,
         cycle: bool = True,
+        entropy_filter: Optional[EntropyFilter] = None,
+        enable_entropy_filtering: bool = False,
     ) -> None:
         """Initialize streaming dataset.
 
@@ -216,6 +246,8 @@ class StreamingBinaryDataset(IterableDataset):
             num_workers: Number of background workers for loading.
             shuffle: Whether to shuffle files.
             cycle: Whether to cycle through files infinitely.
+            entropy_filter: EntropyFilter instance for filtering chunks.
+            enable_entropy_filtering: Whether to enable entropy-based filtering.
         """
         self.directory_path = Path(directory_path)
         self.tokenizer = tokenizer
@@ -225,6 +257,8 @@ class StreamingBinaryDataset(IterableDataset):
         self.num_workers = num_workers
         self.shuffle = shuffle
         self.cycle = cycle
+        self.enable_entropy_filtering = enable_entropy_filtering
+        self.entropy_filter = entropy_filter or EntropyFilter()
 
         # Collect file paths
         self.file_paths = []
@@ -252,6 +286,11 @@ class StreamingBinaryDataset(IterableDataset):
                         chunk = f.read(self.chunk_size)
                         if not chunk:
                             break
+
+                        # Apply entropy filtering if enabled
+                        if self.enable_entropy_filtering:
+                            if not self.entropy_filter.should_sample(chunk, random.random()):
+                                continue  # Skip this chunk
 
                         try:
                             latin1_string = chunk.decode("latin-1", errors="replace")
@@ -440,6 +479,8 @@ def create_dataloader(
     max_files: int | None = None,
     shuffle: bool = True,
     streaming: bool = False,
+    enable_entropy_filtering: bool = False,
+    entropy_filter: Optional[EntropyFilter] = None,
     **kwargs,
 ) -> DataLoader:
     """Create a DataLoader for binary files.
@@ -455,6 +496,8 @@ def create_dataloader(
         max_files: Maximum number of files to load (standard mode only).
         shuffle: Whether to shuffle the data.
         streaming: If True, use StreamingBinaryDataset; else use BinaryDataset.
+        enable_entropy_filtering: Whether to enable entropy-based filtering.
+        entropy_filter: EntropyFilter instance for filtering chunks.
         **kwargs: Additional arguments passed to dataset constructor.
 
     Returns:
@@ -468,6 +511,8 @@ def create_dataloader(
             max_length=max_length,
             chunk_size=chunk_size,
             shuffle=shuffle,
+            enable_entropy_filtering=enable_entropy_filtering,
+            entropy_filter=entropy_filter,
             **kwargs,  # Pass through buffer_size, cycle, etc.
         )
         # Streaming datasets handle their own parallelism
@@ -481,6 +526,8 @@ def create_dataloader(
             max_length=max_length,
             chunk_size=chunk_size,
             max_files=max_files,
+            enable_entropy_filtering=enable_entropy_filtering,
+            entropy_filter=entropy_filter,
             **kwargs,  # Pass through cache_size, file_extensions, etc.
         )
         dataloader_workers = num_workers
