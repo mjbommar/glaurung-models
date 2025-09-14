@@ -953,6 +953,10 @@ class Trainer:
                         ):
                             assessment_results = self.run_assessment()
 
+                            # Clear GPU cache after assessment to prevent OOM
+                            if torch.cuda.is_available():
+                                torch.cuda.empty_cache()
+
                             # Log assessment results to WandB
                             if self.wandb_run and self.accelerator.is_main_process:
                                 wandb.log(assessment_results, step=self.global_step)
@@ -1281,6 +1285,9 @@ class Trainer:
 
         console.print("[yellow]Running assessment...[/yellow]")
 
+        # Set model to eval mode and disable gradients
+        self.model.eval()
+
         # Create assessment instance
         assessment = BinaryAssessment(
             model=self.accelerator.unwrap_model(self.model),
@@ -1288,61 +1295,68 @@ class Trainer:
             device=self.accelerator.device,
         )
 
-        # Run all assessments
+        # Run all assessments with no gradients
         results = {}
 
         try:
-            # File header recognition
-            header_result = assessment.assess_file_header_recognition()
-            results["assessment/file_header_score"] = header_result.score
-            results["assessment/file_header_passed"] = float(header_result.passed)
+            with torch.no_grad():
+                # File header recognition
+                header_result = assessment.assess_file_header_recognition()
+                results["assessment/file_header_score"] = header_result.score
+                results["assessment/file_header_passed"] = float(header_result.passed)
 
-            # Binary pattern learning
-            pattern_result = assessment.assess_binary_pattern_learning()
-            results["assessment/pattern_learning_score"] = pattern_result.score
-            results["assessment/pattern_learning_passed"] = float(pattern_result.passed)
-
-            # Context understanding
-            context_result = assessment.assess_context_understanding()
-            results["assessment/context_understanding_score"] = context_result.score
-            results["assessment/context_understanding_passed"] = float(
-                context_result.passed
-            )
-
-            # Embedding quality
-            embedding_result = assessment.assess_embedding_quality()
-            results["assessment/embedding_quality_score"] = embedding_result.score
-            results["assessment/embedding_quality_passed"] = float(
-                embedding_result.passed
-            )
-
-            # Overall metrics
-            all_scores = [
-                header_result.score,
-                pattern_result.score,
-                context_result.score,
-                embedding_result.score,
-            ]
-            results["assessment/average_score"] = sum(all_scores) / len(all_scores)
-            results["assessment/pass_rate"] = (
-                sum(
-                    [
-                        header_result.passed,
-                        pattern_result.passed,
-                        context_result.passed,
-                        embedding_result.passed,
-                    ]
+                # Binary pattern learning
+                pattern_result = assessment.assess_binary_pattern_learning()
+                results["assessment/pattern_learning_score"] = pattern_result.score
+                results["assessment/pattern_learning_passed"] = float(
+                    pattern_result.passed
                 )
-                / 4.0
-            )
 
-            console.print(
-                f"[green]Assessment complete - Average score: {results['assessment/average_score']:.2%}[/green]"
-            )
+                # Context understanding
+                context_result = assessment.assess_context_understanding()
+                results["assessment/context_understanding_score"] = context_result.score
+                results["assessment/context_understanding_passed"] = float(
+                    context_result.passed
+                )
+
+                # Embedding quality
+                embedding_result = assessment.assess_embedding_quality()
+                results["assessment/embedding_quality_score"] = embedding_result.score
+                results["assessment/embedding_quality_passed"] = float(
+                    embedding_result.passed
+                )
+
+                # Overall metrics
+                all_scores = [
+                    header_result.score,
+                    pattern_result.score,
+                    context_result.score,
+                    embedding_result.score,
+                ]
+                results["assessment/average_score"] = sum(all_scores) / len(all_scores)
+                results["assessment/pass_rate"] = (
+                    sum(
+                        [
+                            header_result.passed,
+                            pattern_result.passed,
+                            context_result.passed,
+                            embedding_result.passed,
+                        ]
+                    )
+                    / 4.0
+                )
+
+                console.print(
+                    f"[green]Assessment complete - Average score: {results['assessment/average_score']:.2%}[/green]"
+                )
 
         except Exception as e:
             console.print(f"[red]Assessment failed: {e}[/red]")
             results["assessment/error"] = 1.0
+
+        finally:
+            # Always restore training mode
+            self.model.train()
 
         return results
 

@@ -729,6 +729,240 @@ def assess(
     )
 
 
+@cli.command(name="assess-all")
+@click.option(
+    "--output-dir",
+    type=click.Path(path_type=Path),
+    default=Path("./output"),
+    help="Directory containing model checkpoints",
+)
+@click.option(
+    "--force",
+    is_flag=True,
+    help="Force re-assessment of all checkpoints",
+)
+def assess_all(output_dir: Path, force: bool) -> None:
+    """Assess all checkpoints and generate comprehensive comparison."""
+    import json
+    import os
+    import re
+    from typing import Any
+
+    def get_checkpoint_number(checkpoint_dir: Path) -> int:
+        """Extract checkpoint number from directory name."""
+        match = re.search(r"checkpoint-(\d+)", checkpoint_dir.name)
+        return int(match.group(1)) if match else 0
+
+    def find_checkpoints(output_dir: Path) -> list[Path]:
+        """Find all checkpoint directories."""
+        if not output_dir.exists():
+            console.print(f"[red]Error: {output_dir} directory not found[/red]")
+            return []
+
+        checkpoints = []
+        for item in output_dir.iterdir():
+            if item.is_dir() and item.name.startswith("checkpoint-"):
+                checkpoints.append(item)
+
+        checkpoints.sort(key=get_checkpoint_number)
+        return checkpoints
+
+    def has_assessment(checkpoint_path: Path) -> bool:
+        """Check if checkpoint already has an assessment."""
+        return (checkpoint_path / "assessment.json").exists()
+
+    def load_assessment_json(checkpoint_path: Path) -> dict[str, Any] | None:
+        """Load assessment JSON for a checkpoint."""
+        assessment_file = checkpoint_path / "assessment.json"
+        if not assessment_file.exists():
+            return None
+
+        try:
+            with open(assessment_file) as f:
+                return json.load(f)
+        except Exception as e:
+            console.print(
+                f"[yellow]Warning: Could not load {assessment_file}: {e}[/yellow]"
+            )
+            return None
+
+    def format_metric_change(current: float, previous: float) -> str:
+        """Format metric change with arrow indicator."""
+        change = current - previous
+        if abs(change) < 0.01:
+            return "→"
+        elif change > 0:
+            return f"↗ +{change:.1f}"
+        else:
+            return f"↘ {change:.1f}"
+
+    # Header
+    console.print()
+    console.print(
+        Panel.fit(
+            "[bold cyan]Checkpoint Assessment Comparison Tool[/bold cyan]",
+            border_style="cyan",
+        )
+    )
+
+    # Find checkpoints
+    checkpoints = find_checkpoints(output_dir)
+    if not checkpoints:
+        console.print("[red]No checkpoints found![/red]")
+        return
+
+    console.print(f"\n[cyan]Found {len(checkpoints)} checkpoints:[/cyan]")
+
+    # Assess checkpoints that need it
+    assessments_run = 0
+    for cp in checkpoints:
+        if force or not has_assessment(cp):
+            status = "[yellow]○ needs assessment[/yellow]"
+        else:
+            status = "[green]✓ has assessment[/green]"
+        console.print(f"  {cp.name} {status}")
+
+    console.print()
+
+    # Run assessments
+    for cp in checkpoints:
+        if force or not has_assessment(cp):
+            console.print(f"[cyan]Assessing {cp.name}...[/cyan]")
+            try:
+                os.environ["CUDA_VISIBLE_DEVICES"] = ""  # Use CPU
+                suite = load_and_assess_model(
+                    checkpoint_path=cp,
+                    tokenizer_path=None,
+                    output_path=cp / "assessment.json",
+                )
+                assessments_run += 1
+            except Exception as e:
+                console.print(f"[red]Failed to assess {cp.name}: {e}[/red]")
+
+    if assessments_run > 0:
+        console.print(f"\n[green]Completed {assessments_run} assessments[/green]")
+
+    # Load all assessments
+    console.print("\n[cyan]Loading results...[/cyan]")
+    assessments = {}
+    for cp in checkpoints:
+        assessment = load_assessment_json(cp)
+        if assessment:
+            num = get_checkpoint_number(cp)
+            assessments[num] = assessment
+
+    if not assessments:
+        console.print("[red]No assessments could be loaded[/red]")
+        return
+
+    checkpoint_nums = sorted(assessments.keys())
+
+    # Create comparison table
+    table = Table(title="Checkpoint Comparison", show_lines=True)
+    table.add_column("Metric", style="cyan")
+
+    for num in checkpoint_nums:
+        table.add_column(str(num), justify="right")
+
+    # Add overall metrics
+    pass_rates = []
+    avg_scores = []
+
+    for num in checkpoint_nums:
+        pass_rates.append(assessments[num]["summary"]["pass_rate"] * 100)
+        avg_scores.append(assessments[num]["summary"]["average_score"] * 100)
+
+    # Pass rate row
+    row = ["Pass Rate %"]
+    for i, rate in enumerate(pass_rates):
+        if i > 0 and len(checkpoint_nums) > 3:
+            change = format_metric_change(rate, pass_rates[i - 1])
+            row.append(f"{rate:.1f} {change}")
+        else:
+            row.append(f"{rate:.1f}%")
+    table.add_row(*row)
+
+    # Average score row
+    row = ["Avg Score %"]
+    for i, score in enumerate(avg_scores):
+        if i > 0 and len(checkpoint_nums) > 3:
+            change = format_metric_change(score, avg_scores[i - 1])
+            row.append(f"{score:.1f} {change}")
+        else:
+            row.append(f"{score:.1f}%")
+    table.add_row(*row)
+
+    # Individual test scores
+    first_assessment = assessments[checkpoint_nums[0]]
+    test_names = [r["test_name"] for r in first_assessment["results"]]
+
+    for test_idx, test_name in enumerate(test_names):
+        row = [test_name]
+        prev_score = None
+
+        for num in checkpoint_nums:
+            score = assessments[num]["results"][test_idx]["score"] * 100
+            passed = assessments[num]["results"][test_idx]["passed"]
+            symbol = "[green]✓[/green]" if passed else "[red]✗[/red]"
+
+            if prev_score is not None and len(checkpoint_nums) > 3:
+                change = format_metric_change(score, prev_score)
+                row.append(f"{score:.1f}{symbol} {change}")
+            else:
+                row.append(f"{score:.1f}{symbol}")
+            prev_score = score
+
+        table.add_row(*row)
+
+    console.print()
+    console.print(table)
+
+    # Find best performers
+    console.print("\n[bold cyan]Best Performers:[/bold cyan]")
+
+    best_avg = max(
+        checkpoint_nums, key=lambda n: assessments[n]["summary"]["average_score"]
+    )
+    best_avg_score = assessments[best_avg]["summary"]["average_score"] * 100
+    console.print(
+        f"  Best Average Score: [green]Checkpoint-{best_avg}[/green] ({best_avg_score:.1f}%)"
+    )
+
+    best_pass = max(
+        checkpoint_nums, key=lambda n: assessments[n]["summary"]["pass_rate"]
+    )
+    best_pass_rate = assessments[best_pass]["summary"]["pass_rate"] * 100
+    console.print(
+        f"  Best Pass Rate: [green]Checkpoint-{best_pass}[/green] ({best_pass_rate:.1f}%)"
+    )
+
+    # Check for plateau
+    if len(checkpoint_nums) >= 3:
+        last_three = checkpoint_nums[-3:]
+        scores = [assessments[n]["summary"]["average_score"] * 100 for n in last_three]
+        if max(scores) - min(scores) < 0.5:
+            console.print("\n[yellow]⚠ Model appears to have plateaued[/yellow]")
+            console.print(
+                f"  Last 3 checkpoints vary by <0.5%: {scores[0]:.1f}% - {scores[-1]:.1f}%"
+            )
+
+    # Visual chart for average score
+    console.print("\n[bold cyan]Average Score Progression:[/bold cyan]")
+    max_score = max(avg_scores)
+
+    for i, (num, score) in enumerate(zip(checkpoint_nums, avg_scores, strict=False)):
+        bar_length = int(score * 2)
+        bar = "█" * bar_length
+
+        marker = ""
+        if score == max_score:
+            marker = " [yellow]⭐ PEAK[/yellow]"
+        elif i == len(checkpoint_nums) - 1:
+            marker = " [cyan]← Current[/cyan]"
+
+        console.print(f"  {num:5}: {bar:<40} {score:5.1f}%{marker}")
+
+
 @cli.command()
 def info() -> None:
     """Display information about the package."""
@@ -744,7 +978,8 @@ def info() -> None:
         "• Early stopping and embedding quality monitoring\n\n"
         "[dim]Usage:[/dim]\n"
         "  binary-embedding train --help\n"
-        "  binary-embedding assess --help",
+        "  binary-embedding assess --help\n"
+        "  binary-embedding assess-all --help",
         border_style="cyan",
     )
     console.print(info_panel)

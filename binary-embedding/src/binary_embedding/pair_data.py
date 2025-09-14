@@ -14,8 +14,8 @@ from __future__ import annotations
 
 import os
 import random
-from collections import defaultdict, deque
 import threading
+from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any

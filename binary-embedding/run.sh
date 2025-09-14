@@ -3,18 +3,22 @@
 # Generate timestamp for run name
 TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
 
-# nas4/data/glaurung-data/binaries/ 
+# 
 
-PYTHONPATH=src uv run python -m binary_embedding.cli train \
-       --model-size small \
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+export PYTHONPATH=src
+
+uv run python -m binary_embedding.cli train \
+       --model-size base \
        --model-type roberta \
-       --data-dir /usr/bin \
+       --data-dir /home/ubuntu/data/binaries/ \
        --max-steps 100000 \
-       --warmup-ratio 0.02 \
+       --warmup-ratio 0.05 \
        --save-steps 100 \
        --gradient-checkpointing \
-       --batch-size 10 \
-       --gradient-accumulation-steps 10 \
+       --learning-rate 0.0001 \
+       --batch-size 96 \
+       --gradient-accumulation-steps 8 \
        --save-total-limit 10 \
        --run-assessment \
        --assessment-steps 100 \
@@ -25,9 +29,9 @@ PYTHONPATH=src uv run python -m binary_embedding.cli train \
        --min-chunk-separation 4096 \
        --contrastive-temp 0.07 \
        --mlm-weight 1.0 \
-       --view-weight 0.5 \
-       --samefile-weight 0.5 \
-       --contrastive-ramp-steps 2000 \
+       --view-weight 0.25 \
+       --samefile-weight 0.25 \
+       --contrastive-ramp-steps 5000 \
        --pair-cache-size 4096 \
        --prefetch-factor 4 \
        --num-workers 4 \
