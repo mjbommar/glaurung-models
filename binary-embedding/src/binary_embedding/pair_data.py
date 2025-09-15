@@ -18,13 +18,13 @@ import threading
 from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 import torch
 from torch.utils.data import DataLoader, Dataset, IterableDataset
 
-from .tokenizer import BinaryTokenizer
 from .entropy import EntropyFilter
+from .tokenizer import BinaryTokenizer
 
 
 class SameFilePairDataset(Dataset):
@@ -52,7 +52,7 @@ class SameFilePairDataset(Dataset):
         max_files: int | None = None,
         file_extensions: list[str] | None = None,
         tokenize_in_dataset: bool = False,
-        entropy_filter: Optional[EntropyFilter] = None,
+        entropy_filter: EntropyFilter | None = None,
         enable_entropy_filtering: bool = False,
     ) -> None:
         self.directory_path = Path(directory_path)
@@ -203,12 +203,18 @@ class SameFilePairDataset(Dataset):
                     raw_chunk1 = f.read(self.chunk_size)
                     if raw_chunk1:
                         # Probabilistically skip based on entropy
-                        if not self.entropy_filter.should_sample(raw_chunk1, random.random()):
+                        if not self.entropy_filter.should_sample(
+                            raw_chunk1, random.random()
+                        ):
                             # Return empty/padding data for filtered chunks
                             if self.tokenize_in_dataset:
                                 zero_enc = {
-                                    "input_ids": torch.zeros(self.max_length, dtype=torch.long),
-                                    "attention_mask": torch.zeros(self.max_length, dtype=torch.long),
+                                    "input_ids": torch.zeros(
+                                        self.max_length, dtype=torch.long
+                                    ),
+                                    "attention_mask": torch.zeros(
+                                        self.max_length, dtype=torch.long
+                                    ),
                                 }
                                 return {
                                     "input_ids_1": zero_enc["input_ids"],
@@ -399,7 +405,7 @@ def create_pair_dataloader(
     prefetch_factor: int | None = 4,
     tokenize_in_dataset: bool = False,
     enable_entropy_filtering: bool = False,
-    entropy_filter: Optional[EntropyFilter] = None,
+    entropy_filter: EntropyFilter | None = None,
     **kwargs: Any,
 ) -> DataLoader:
     """Create a DataLoader that yields same-file pairs with MLM labels.
@@ -464,7 +470,7 @@ class StreamingSameFilePairDataset(IterableDataset):
         per_file_buffer: int = 32,
         shuffle: bool = True,
         cycle: bool = True,
-        entropy_filter: Optional[EntropyFilter] = None,
+        entropy_filter: EntropyFilter | None = None,
         enable_entropy_filtering: bool = False,
     ) -> None:
         self.directory_path = Path(directory_path)
@@ -511,13 +517,15 @@ class StreamingSameFilePairDataset(IterableDataset):
                         chunk = f.read(self.chunk_size)
                         if not chunk:
                             break
-                        
+
                         # Apply entropy filtering if enabled
                         if self.enable_entropy_filtering:
-                            if not self.entropy_filter.should_sample(chunk, random.random()):
+                            if not self.entropy_filter.should_sample(
+                                chunk, random.random()
+                            ):
                                 offset += self.chunk_size
                                 continue  # Skip this chunk
-                        
+
                         try:
                             text = chunk.decode("latin-1", errors="replace")
                         except Exception:
@@ -633,7 +641,7 @@ def create_streaming_pair_dataloader(
     shuffle: bool = True,
     cycle: bool = True,
     enable_entropy_filtering: bool = False,
-    entropy_filter: Optional[EntropyFilter] = None,
+    entropy_filter: EntropyFilter | None = None,
 ) -> DataLoader:
     """Create a streaming DataLoader that yields pairs continuously.
 

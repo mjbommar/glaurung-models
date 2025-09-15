@@ -66,13 +66,13 @@ class TrainerConfig:
     """Configuration for training with optional advanced features."""
 
     # Basic training parameters
-    learning_rate: float = 2e-5  # Optimal for BERT models
-    weight_decay: float = 0.01
+    learning_rate: float = 5e-5  # Better for diverse binary datasets
+    weight_decay: float = 0.0001  # Reduced for better memorization
     adam_beta1: float = 0.9
     adam_beta2: float = 0.999
     adam_epsilon: float = 1e-8
     max_grad_norm: float = 1.0
-    
+
     # Adaptive gradient clipping
     use_adaptive_grad_clip: bool = False
     grad_clip_percentile: float = 95.0  # Use 95th percentile of recent gradients
@@ -158,7 +158,7 @@ class TrainerConfig:
         """
         if model_size == "small":
             config = cls(
-                learning_rate=2e-5,
+                learning_rate=5e-5,  # Increased for better learning
                 batch_size=16,
                 gradient_accumulation_steps=2,
                 scheduler_type="cosine",
@@ -166,7 +166,7 @@ class TrainerConfig:
             )
         elif model_size == "base":
             config = cls(
-                learning_rate=3e-5,
+                learning_rate=5e-5,  # Increased for 50GB diverse dataset
                 batch_size=8,
                 gradient_accumulation_steps=4,
                 scheduler_type="two_phase",
@@ -174,7 +174,7 @@ class TrainerConfig:
             )
         else:  # large
             config = cls(
-                learning_rate=1e-5,
+                learning_rate=3e-5,  # Increased but still conservative for large
                 batch_size=4,
                 gradient_accumulation_steps=8,
                 scheduler_type="cosine_with_restarts",
@@ -361,9 +361,11 @@ class Trainer:
         self.global_step = 0
         self.best_val_loss = float("inf")
         self.training_history: list[dict[str, Any]] = []
-        
+
         # Gradient norm tracking for adaptive clipping
-        self.grad_norm_history: deque[float] = deque(maxlen=config.grad_clip_history_size)
+        self.grad_norm_history: deque[float] = deque(
+            maxlen=config.grad_clip_history_size
+        )
         self.starting_epoch = 0
 
         # Initialize WandB if enabled
@@ -772,33 +774,40 @@ class Trainer:
                                     if p.grad is not None:
                                         param_norm = p.grad.data.norm(2)
                                         total_norm += param_norm.item() ** 2
-                                current_grad_norm = total_norm ** 0.5
-                                
+                                current_grad_norm = total_norm**0.5
+
                                 # Determine clipping threshold
-                                if self.global_step < self.config.grad_clip_history_size:
+                                if (
+                                    self.global_step
+                                    < self.config.grad_clip_history_size
+                                ):
                                     # Use initial threshold for first N steps
-                                    clip_threshold = self.config.grad_clip_initial_threshold
+                                    clip_threshold = (
+                                        self.config.grad_clip_initial_threshold
+                                    )
                                 else:
                                     # Use percentile of recent gradient norms
                                     if len(self.grad_norm_history) > 0:
                                         clip_threshold = np.percentile(
-                                            list(self.grad_norm_history), 
-                                            self.config.grad_clip_percentile
+                                            list(self.grad_norm_history),
+                                            self.config.grad_clip_percentile,
                                         )
                                         # Ensure we don't go below a minimum threshold
                                         clip_threshold = max(clip_threshold, 1.0)
                                     else:
-                                        clip_threshold = self.config.grad_clip_initial_threshold
-                                
+                                        clip_threshold = (
+                                            self.config.grad_clip_initial_threshold
+                                        )
+
                                 # Apply gradient clipping with adaptive threshold
                                 grad_norm = self.accelerator.clip_grad_norm_(
                                     self.model.parameters(),
                                     clip_threshold,
                                 )
-                                
+
                                 # Track gradient norm for future percentile calculation
                                 self.grad_norm_history.append(current_grad_norm)
-                                
+
                                 # Store threshold for logging
                                 adaptive_clip_threshold = clip_threshold
                             else:
@@ -1231,7 +1240,8 @@ class Trainer:
             # For streaming datasets, we can't get the length, so estimate or skip
             try:
                 steps_per_epoch = (
-                    len(self.train_dataloader) // self.config.gradient_accumulation_steps
+                    len(self.train_dataloader)
+                    // self.config.gradient_accumulation_steps
                 )
                 self.starting_epoch = self.global_step // steps_per_epoch
             except TypeError:

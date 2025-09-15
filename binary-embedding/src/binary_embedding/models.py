@@ -36,8 +36,8 @@ class BinaryEmbeddingConfig:
     num_attention_heads: int = 12
     intermediate_size: int = 3072
     hidden_act: str = "gelu"
-    hidden_dropout_prob: float = 0.1
-    attention_probs_dropout_prob: float = 0.1
+    hidden_dropout_prob: float = 0.01  # Reduced for better memorization
+    attention_probs_dropout_prob: float = 0.01  # Reduced for better memorization
     max_position_embeddings: int = 520  # Increased for RoBERTa padding offset
     type_vocab_size: int = 1
     initializer_range: float = 0.02
@@ -49,7 +49,7 @@ class BinaryEmbeddingConfig:
 
     # Training hyperparameters
     learning_rate: float = 5e-5
-    weight_decay: float = 0.01
+    weight_decay: float = 0.0001  # Reduced for better memorization
     adam_beta1: float = 0.9
     adam_beta2: float = 0.999
     adam_epsilon: float = 1e-8

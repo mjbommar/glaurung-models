@@ -19,13 +19,12 @@ import threading
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Optional
 
 import torch
 from torch.utils.data import DataLoader, Dataset, IterableDataset
 
-from binary_embedding.tokenizer import BinaryTokenizer
 from binary_embedding.entropy import EntropyFilter
+from binary_embedding.tokenizer import BinaryTokenizer
 
 
 class BinaryDataset(Dataset):
@@ -46,7 +45,7 @@ class BinaryDataset(Dataset):
         max_files: int | None = None,
         file_extensions: list[str] | None = None,
         cache_size: int = 1000,
-        entropy_filter: Optional[EntropyFilter] = None,
+        entropy_filter: EntropyFilter | None = None,
         enable_entropy_filtering: bool = False,
     ) -> None:
         """Initialize the dataset.
@@ -192,11 +191,17 @@ class BinaryDataset(Dataset):
                     raw_chunk = f.read(self.chunk_size)
                     if raw_chunk:
                         # Probabilistically skip based on entropy
-                        if not self.entropy_filter.should_sample(raw_chunk, random.random()):
+                        if not self.entropy_filter.should_sample(
+                            raw_chunk, random.random()
+                        ):
                             # Return padding for filtered chunks
                             return {
-                                "input_ids": torch.zeros(self.max_length, dtype=torch.long),
-                                "attention_mask": torch.zeros(self.max_length, dtype=torch.long),
+                                "input_ids": torch.zeros(
+                                    self.max_length, dtype=torch.long
+                                ),
+                                "attention_mask": torch.zeros(
+                                    self.max_length, dtype=torch.long
+                                ),
                             }
             except Exception:
                 pass
@@ -232,7 +237,7 @@ class StreamingBinaryDataset(IterableDataset):
         num_workers: int = 4,
         shuffle: bool = True,
         cycle: bool = True,
-        entropy_filter: Optional[EntropyFilter] = None,
+        entropy_filter: EntropyFilter | None = None,
         enable_entropy_filtering: bool = False,
     ) -> None:
         """Initialize streaming dataset.
@@ -289,7 +294,9 @@ class StreamingBinaryDataset(IterableDataset):
 
                         # Apply entropy filtering if enabled
                         if self.enable_entropy_filtering:
-                            if not self.entropy_filter.should_sample(chunk, random.random()):
+                            if not self.entropy_filter.should_sample(
+                                chunk, random.random()
+                            ):
                                 continue  # Skip this chunk
 
                         try:
@@ -480,7 +487,7 @@ def create_dataloader(
     shuffle: bool = True,
     streaming: bool = False,
     enable_entropy_filtering: bool = False,
-    entropy_filter: Optional[EntropyFilter] = None,
+    entropy_filter: EntropyFilter | None = None,
     **kwargs,
 ) -> DataLoader:
     """Create a DataLoader for binary files.

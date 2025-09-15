@@ -485,7 +485,9 @@ def train(
     )
     config_table.add_row("Learning Rate", f"{base_config.learning_rate:.2e}")
     if use_adaptive_grad_clip:
-        config_table.add_row("Adaptive Grad Clip", f"✓ ({grad_clip_percentile:.0f}%ile)")
+        config_table.add_row(
+            "Adaptive Grad Clip", f"✓ ({grad_clip_percentile:.0f}%ile)"
+        )
     else:
         config_table.add_row("Max Grad Norm", f"{max_grad_norm:.1f}")
     config_table.add_row("Scheduler", base_config.scheduler_type)
@@ -587,10 +589,10 @@ def train(
     entropy_filter = None
     if enable_entropy_filtering:
         # Parse entropy bins and weights from comma-separated strings
-        bins = [float(x.strip()) for x in entropy_bins.split(',')]
-        weights = [float(x.strip()) for x in entropy_weights.split(',')]
+        bins = [float(x.strip()) for x in entropy_bins.split(",")]
+        weights = [float(x.strip()) for x in entropy_weights.split(",")]
         entropy_filter = EntropyFilter(entropy_bins=bins, sampling_weights=weights)
-        console.print(f"[yellow]Entropy filtering enabled[/yellow]")
+        console.print("[yellow]Entropy filtering enabled[/yellow]")
         console.print(f"  Bins: {bins}")
         console.print(f"  Weights: {weights}")
 
