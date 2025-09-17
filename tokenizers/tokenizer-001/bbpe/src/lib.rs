@@ -4,6 +4,7 @@ pub mod post;
 pub mod train;
 pub mod util;
 pub mod cli;
+pub mod patterns;
 
 pub use ingest::{ChunkingMode, CorpusIter, IngestConfig};
 pub use mapping::{bytes_to_latin1_string, latin1_string_to_bytes};

@@ -1,4 +1,5 @@
 use crate::ingest::CorpusIter;
+use crate::patterns::{generate_pattern_tokens, generate_pattern_strings, PatternConfig};
 use crate::post::{build_template_processor, SpecialTokenSet};
 use crate::util::{is_power_of_two, next_power_of_two};
 use anyhow::{anyhow, Result};
@@ -58,6 +59,7 @@ fn make_special_tokens(base: &SpecialTokenSet, reserved: usize) -> Vec<AddedToke
 pub fn train_tokenizer(
     iter: CorpusIter,
     trainer_cfg: &TrainerConfig,
+    pattern_cfg: &PatternConfig,
 ) -> Result<Tokenizer> {
     // Trainer setup
     // Special tokens (base + reserved)
@@ -95,6 +97,30 @@ pub fn train_tokenizer(
     // Assemble tokenizer
     let mut tokenizer = Tokenizer::new(bpe);
     tokenizer.add_special_tokens(&special_tokens);
+    
+    // Add pattern tokens with their corresponding byte sequences
+    if pattern_cfg.enabled {
+        let pattern_tokens = generate_pattern_tokens(pattern_cfg);
+        let pattern_strings = generate_pattern_strings(pattern_cfg);
+        
+        if !pattern_tokens.is_empty() {
+            eprintln!("Adding {} pattern tokens to vocabulary", pattern_tokens.len());
+            
+            // Create AddedTokens that map the actual byte sequences to token names
+            let mut pattern_added_tokens = Vec::new();
+            for (token_name, byte_sequence) in pattern_strings.iter() {
+                // Add the token with its byte sequence as the content
+                // This way when the tokenizer sees these exact byte sequences, 
+                // it will use the pattern token
+                let token = AddedToken::from(byte_sequence.clone(), false)
+                    .single_word(false)
+                    .normalized(false); // Don't normalize these sequences
+                pattern_added_tokens.push(token);
+            }
+            
+            tokenizer.add_tokens(&pattern_added_tokens);
+        }
+    }
 
     if trainer_cfg.with_template {
         let proc = build_template_processor(&tokenizer, &specials)?;

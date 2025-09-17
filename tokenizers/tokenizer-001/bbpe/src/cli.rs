@@ -1,4 +1,5 @@
 use crate::ingest::{collect_files, ChunkingMode, CorpusIter, IngestConfig};
+use crate::patterns::{PatternConfig, PatternType};
 use crate::train::{pad_vocab_to_power_of_two, train_tokenizer, TrainerConfig};
 use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
@@ -96,6 +97,58 @@ pub enum Commands {
         /// Output tokenizer.json path
         #[arg(long, default_value = "tokenizer.json")]
         output: PathBuf,
+
+        /// Enable common opcode/pattern sequences
+        #[arg(long, default_value_t = false)]
+        enable_patterns: bool,
+
+        /// Minimum pattern length as power of 2 (e.g., 2 means 2^2 = 4 bytes)
+        #[arg(long, default_value_t = 2)]
+        min_pattern_pow2: u8,
+
+        /// Maximum pattern length as power of 2 (exclusive, e.g., 11 means up to 2^10 = 1024)
+        #[arg(long, default_value_t = 11)]
+        max_pattern_pow2: u8,
+
+        /// Enable null byte patterns (0x00)
+        #[arg(long, default_value_t = true)]
+        pattern_null: bool,
+
+        /// Enable x86 NOP patterns (0x90)
+        #[arg(long, default_value_t = true)]
+        pattern_nop_x86: bool,
+
+        /// Enable x86 INT3 patterns (0xCC)
+        #[arg(long, default_value_t = true)]
+        pattern_int3: bool,
+
+        /// Enable FF padding patterns (0xFF)
+        #[arg(long, default_value_t = true)]
+        pattern_ff: bool,
+
+        /// Enable RISC NOP patterns (0x00000000)
+        #[arg(long, default_value_t = false)]
+        pattern_nop_risc: bool,
+
+        /// Enable space patterns (0x20)
+        #[arg(long, default_value_t = true)]
+        pattern_space: bool,
+
+        /// Enable dot patterns (0x2E)
+        #[arg(long, default_value_t = false)]
+        pattern_dot: bool,
+
+        /// Enable slash patterns (0x2F)
+        #[arg(long, default_value_t = false)]
+        pattern_slash: bool,
+
+        /// Enable 0x01 byte patterns
+        #[arg(long, default_value_t = false)]
+        pattern_one: bool,
+
+        /// Enable ASCII '0' patterns (0x30)
+        #[arg(long, default_value_t = false)]
+        pattern_zero: bool,
     },
 }
 
@@ -121,6 +174,19 @@ pub fn run() -> Result<()> {
             pad_pow2,
             max_token_length,
             output,
+            enable_patterns,
+            min_pattern_pow2,
+            max_pattern_pow2,
+            pattern_null,
+            pattern_nop_x86,
+            pattern_int3,
+            pattern_ff,
+            pattern_nop_risc,
+            pattern_space,
+            pattern_dot,
+            pattern_slash,
+            pattern_one,
+            pattern_zero,
         } => {
             let ingest_cfg = IngestConfig {
                 follow_symlinks: false,
@@ -150,6 +216,46 @@ pub fn run() -> Result<()> {
             };
             let iter = CorpusIter::new(files, chunking, ingest_cfg);
 
+            // Build pattern configuration
+            let mut patterns = Vec::new();
+            if pattern_null {
+                patterns.push(PatternType::Null);
+            }
+            if pattern_nop_x86 {
+                patterns.push(PatternType::NopX86);
+            }
+            if pattern_int3 {
+                patterns.push(PatternType::Int3);
+            }
+            if pattern_ff {
+                patterns.push(PatternType::FfPad);
+            }
+            if pattern_nop_risc {
+                patterns.push(PatternType::NopRisc);
+            }
+            if pattern_space {
+                patterns.push(PatternType::Space);
+            }
+            if pattern_dot {
+                patterns.push(PatternType::Dot);
+            }
+            if pattern_slash {
+                patterns.push(PatternType::Slash);
+            }
+            if pattern_one {
+                patterns.push(PatternType::One);
+            }
+            if pattern_zero {
+                patterns.push(PatternType::Zero);
+            }
+            
+            let pattern_cfg = PatternConfig {
+                enabled: enable_patterns,
+                min_power: min_pattern_pow2,
+                max_power: max_pattern_pow2,
+                patterns,
+            };
+            
             let trainer_cfg = TrainerConfig {
                 vocab_size,
                 min_frequency,
@@ -160,7 +266,7 @@ pub fn run() -> Result<()> {
                 max_token_length,
             };
 
-            let mut tokenizer = train_tokenizer(iter, &trainer_cfg)?;
+            let mut tokenizer = train_tokenizer(iter, &trainer_cfg, &pattern_cfg)?;
             if pad_pow2 {
                 pad_vocab_to_power_of_two(&mut tokenizer)?;
             }
