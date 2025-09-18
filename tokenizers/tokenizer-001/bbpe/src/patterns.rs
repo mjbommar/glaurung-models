@@ -37,16 +37,16 @@ impl PatternType {
     /// Get the token name for this pattern at a given length
     fn token_name(&self, length: usize) -> String {
         match self {
-            PatternType::Null => format!("<|null_{}|>", length),
-            PatternType::NopX86 => format!("<|nop_x86_{}|>", length),
-            PatternType::Int3 => format!("<|int3_{}|>", length),
-            PatternType::FfPad => format!("<|ff_{}|>", length),
+            PatternType::Null => format!("<|null_{length}|>"),
+            PatternType::NopX86 => format!("<|nop_x86_{length}|>"),
+            PatternType::Int3 => format!("<|int3_{length}|>"),
+            PatternType::FfPad => format!("<|ff_{length}|>"),
             PatternType::NopRisc => format!("<|nop_risc_{}|>", length / 4), // count of 4-byte NOPs
-            PatternType::Space => format!("<|space_{}|>", length),
-            PatternType::Dot => format!("<|dot_{}|>", length),
-            PatternType::Slash => format!("<|slash_{}|>", length),
-            PatternType::One => format!("<|one_{}|>", length),
-            PatternType::Zero => format!("<|zero_{}|>", length),
+            PatternType::Space => format!("<|space_{length}|>"),
+            PatternType::Dot => format!("<|dot_{length}|>"),
+            PatternType::Slash => format!("<|slash_{length}|>"),
+            PatternType::One => format!("<|one_{length}|>"),
+            PatternType::Zero => format!("<|zero_{length}|>"),
         }
     }
     

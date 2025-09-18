@@ -74,7 +74,7 @@ pub fn train_tokenizer(
         target_vocab_size = next_power_of_two(target_vocab_size);
     }
 
-    let mut builder = BpeTrainer::builder()
+    let builder = BpeTrainer::builder()
         .vocab_size(target_vocab_size)
         .min_frequency(trainer_cfg.min_frequency)
         .show_progress(trainer_cfg.show_progress)

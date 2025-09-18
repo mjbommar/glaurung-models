@@ -1,5 +1,5 @@
 use crate::mapping::bytes_to_latin1_string;
-use anyhow::{Context, Result};
+use anyhow::Result;
 use rand::{rngs::StdRng, Rng, SeedableRng};
 use std::fs::File;
 use std::io::{BufReader, Read};

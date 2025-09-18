@@ -4,7 +4,6 @@ use crate::train::{pad_vocab_to_power_of_two, train_tokenizer, TrainerConfig};
 use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
-use tokenizers::Tokenizer;
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
 pub enum ModeArg {
@@ -272,9 +271,9 @@ pub fn run() -> Result<()> {
             }
             // Save tokenizer.json
             let f = std::fs::File::create(&output)
-                .with_context(|| format!("creating {:?}", output))?;
+                .with_context(|| format!("creating {output:?}"))?;
             serde_json::to_writer_pretty(f, &tokenizer)?;
-            eprintln!("Saved tokenizer to {:?}", output);
+            eprintln!("Saved tokenizer to {output:?}");
         }
     }
 
