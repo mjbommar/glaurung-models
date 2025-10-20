@@ -1,4 +1,23 @@
 /.cargo/
 /.uv-cache/
 /target/
-/bench/
+
+# Bench directory - track organized structure but ignore old/temp files
+/bench/binaries-small-32k/
+/bench/glaurung-tokenizer-002/
+/bench/man-pages-text/
+/bench/man-pages-text-real/
+
+# Ignore large uncompressed training logs
+/bench/**/*.log
+/bench/**/TRAINING_LOG.txt
+/bench/**/*.sh
+
+# Ignore Python cache
+/bench/**/__pycache__/
+/bench/**/*.pyc
+
+# Ignore temporary/backup files
+/bench/**/*~
+/bench/**/*.bak
+/bench/**/*.tmp
