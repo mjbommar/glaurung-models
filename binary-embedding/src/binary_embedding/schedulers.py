@@ -28,6 +28,7 @@ class SchedulerType(Enum):
     COSINE_WITH_RESTARTS = "cosine_with_restarts"
     TWO_PHASE = "two_phase"
     POLYNOMIAL = "polynomial"
+    TRAPEZOIDAL = "trapezoidal"
 
 
 @dataclass
@@ -52,6 +53,9 @@ class SchedulerConfig:
 
     # For polynomial decay
     power: float = 1.0  # 1.0 = linear, >1.0 = slower decay
+
+    # For trapezoidal schedule
+    plateau_ratio: float = 0.6  # Fraction of steps to maintain peak LR
 
     # General settings
     min_lr_ratio: float = 0.01  # Minimum LR as ratio of initial LR
@@ -187,6 +191,25 @@ def create_scheduler(
 
             progress = (step - warmup_steps) / (num_training_steps - warmup_steps)
             return max(config.min_lr_ratio, (1 - progress) ** config.power)
+
+        return LambdaLR(optimizer, lr_lambda)
+
+    elif config.scheduler_type == SchedulerType.TRAPEZOIDAL:
+        # Trapezoidal: warmup -> plateau -> linear decay
+        plateau_steps = int((num_training_steps - warmup_steps) * config.plateau_ratio)
+        decay_start = warmup_steps + plateau_steps
+
+        def lr_lambda(step: int) -> float:
+            if step < warmup_steps:
+                # Warmup phase: linear ramp to 1.0
+                return step / warmup_steps
+            elif step < decay_start:
+                # Plateau phase: maintain peak LR
+                return 1.0
+            else:
+                # Decay phase: linear decay to min_lr_ratio
+                decay_progress = (step - decay_start) / (num_training_steps - decay_start)
+                return max(config.min_lr_ratio, 1.0 - decay_progress * (1.0 - config.min_lr_ratio))
 
         return LambdaLR(optimizer, lr_lambda)
 

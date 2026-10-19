@@ -21,25 +21,37 @@ class BinaryTokenizer:
         self.tokenizer = Tokenizer.from_file(str(tokenizer_path))
         self.vocab_size: int = self.tokenizer.get_vocab_size()
 
-        # Get special token IDs
-        # Note: The tokenizer has <|start|> at 0 and <|end|> at 1
-        self.start_token_id: int = self.tokenizer.token_to_id("<|start|>")
-        self.end_token_id: int = self.tokenizer.token_to_id("<|end|>")
-        self.sep_token_id: int = self.tokenizer.token_to_id("<|sep|>")
-        self.cls_token_id: int = self.tokenizer.token_to_id("<|cls|>")
-        self.pad_token_id: int = self.tokenizer.token_to_id("<|pad|>")
-        self.mask_token_id: int = self.tokenizer.token_to_id("<|mask|>")
-        self.unk_token_id: int = self.tokenizer.token_to_id("<|unk|>")
+        # Get special token IDs - support multiple formats
+        # binary-tokenizer-005: <|start|>, <|end|>, etc. (at IDs 0-134)
+        # glaurung-tokenizer-002: <s>, </s>, etc. (at IDs 65529-65535)
+        def get_special_token_id(alternatives: list[str], default: int | None = None) -> int:
+            """Try multiple token formats, return first match or default."""
+            for token_str in alternatives:
+                token_id = self.tokenizer.token_to_id(token_str)
+                if token_id is not None:
+                    return token_id
+            if default is None:
+                raise ValueError(f"None of {alternatives} found in tokenizer and no default provided")
+            return default
 
-        # Store special tokens
+        self.start_token_id: int = get_special_token_id(["<|start|>", "<s>", "[BOS]"])
+        self.end_token_id: int = get_special_token_id(["<|end|>", "</s>", "[EOS]"])
+        self.sep_token_id: int = get_special_token_id(["<|sep|>", "<sep>", "[SEP]"])
+        self.cls_token_id: int = get_special_token_id(["<|cls|>", "<cls>", "[CLS]"])
+        self.pad_token_id: int = get_special_token_id(["<|pad|>", "<pad>", "[PAD]"])
+        self.mask_token_id: int = get_special_token_id(["<|mask|>", "<mask>", "[MASK]"])
+        self.unk_token_id: int = get_special_token_id(["<|unk|>", "<unk>", "[UNK]"])
+
+        # Store actual special token strings found in tokenizer
+        vocab_reversed = {v: k for k, v in self.tokenizer.get_vocab().items()}
         self.special_tokens: dict[str, str] = {
-            "pad_token": "<|pad|>",
-            "unk_token": "<|unk|>",
-            "cls_token": "<|cls|>",
-            "sep_token": "<|sep|>",
-            "mask_token": "<|mask|>",
-            "start_token": "<|start|>",
-            "end_token": "<|end|>",
+            "pad_token": vocab_reversed[self.pad_token_id],
+            "unk_token": vocab_reversed[self.unk_token_id],
+            "cls_token": vocab_reversed[self.cls_token_id],
+            "sep_token": vocab_reversed[self.sep_token_id],
+            "mask_token": vocab_reversed[self.mask_token_id],
+            "start_token": vocab_reversed[self.start_token_id],
+            "end_token": vocab_reversed[self.end_token_id],
         }
 
     def encode(
@@ -165,7 +177,8 @@ def load_tokenizer(
     """Load the binary tokenizer.
 
     Args:
-        tokenizer_path: Path to tokenizer.json file. If None, uses default path.
+        tokenizer_path: Path to tokenizer.json file, or HuggingFace Hub repo (e.g., 'username/repo').
+                       If None, uses default path.
 
     Returns:
         BinaryTokenizer instance.
@@ -173,4 +186,22 @@ def load_tokenizer(
     if tokenizer_path is None:
         tokenizer_path = Path("binary-tokenizer-005/tokenizer.json")
 
+    # Check if it's a HuggingFace Hub repo (format: username/repo)
+    tokenizer_str = str(tokenizer_path)
+    if "/" in tokenizer_str and not tokenizer_str.startswith(("./", "../", "/")):
+        # Looks like a HuggingFace Hub repo
+        try:
+            from huggingface_hub import hf_hub_download
+            # Download tokenizer.json from the repo
+            local_path = hf_hub_download(
+                repo_id=tokenizer_str,
+                filename="tokenizer.json",
+            )
+            return BinaryTokenizer(local_path)
+        except Exception as e:
+            # If HF Hub loading fails, fall back to treating it as a local path
+            print(f"Warning: Failed to load from HuggingFace Hub: {e}")
+            print(f"Attempting to load as local path: {tokenizer_path}")
+
+    # Load from local path
     return BinaryTokenizer(tokenizer_path)

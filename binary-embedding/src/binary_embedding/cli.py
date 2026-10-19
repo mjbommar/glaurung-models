@@ -13,13 +13,17 @@ from rich.table import Table
 from binary_embedding.assessment import load_and_assess_model
 from binary_embedding.data import create_dataloader
 from binary_embedding.entropy import EntropyFilter
-from binary_embedding.models import ModelSize, create_model
+from binary_embedding.models import BinaryEmbeddingConfig, ModelSize, create_model
 from binary_embedding.pair_data import (
     create_pair_dataloader,
     create_streaming_pair_dataloader,
 )
 from binary_embedding.tokenizer import load_tokenizer
-from binary_embedding.training import Trainer, TrainerConfig
+from binary_embedding.training import (
+    ContrastiveTrainer,
+    MLMTrainer,
+    TrainerConfig,
+)
 
 console = Console()
 
@@ -30,345 +34,394 @@ def cli() -> None:
     pass
 
 
-@cli.command()
-@click.option(
-    "--model-size",
-    type=click.Choice(["small", "base", "large"]),
-    default="small",
-    help="Model size to train",
-)
-@click.option(
-    "--model-type",
-    type=click.Choice(["bert", "roberta"]),
-    default="roberta",
-    help="Model architecture type",
-)
-@click.option(
-    "--data-dir",
-    type=click.Path(exists=True, path_type=Path),
-    default="/usr/bin",
-    help="Directory containing binary files",
-)
-@click.option(
-    "--tokenizer-path",
-    type=click.Path(exists=True, path_type=Path),
-    default=None,
-    help="Path to tokenizer.json file (uses default if not provided)",
-)
-@click.option(
-    "--output-dir",
-    type=click.Path(path_type=Path),
-    default="./output",
-    help="Output directory for checkpoints",
-)
-@click.option(
-    "--batch-size",
-    type=int,
-    default=None,
-    help="Per-device batch size (auto-selected based on model size if not specified)",
-)
-@click.option(
-    "--num-epochs",
-    type=int,
-    default=3,
-    help="Number of training epochs",
-)
-@click.option(
-    "--max-steps",
-    type=int,
-    default=None,
-    help="Maximum training steps (overrides num-epochs if set)",
-)
-@click.option(
-    "--learning-rate",
-    type=float,
-    default=None,
-    help="Learning rate (auto-selected based on model size if not specified)",
-)
-@click.option(
-    "--scheduler-type",
-    type=click.Choice(
-        ["linear", "cosine", "cosine_with_restarts", "two_phase", "polynomial"]
-    ),
-    default=None,
-    help="Learning rate scheduler type (auto-selected based on model size if not specified)",
-)
-@click.option(
-    "--warmup-steps",
-    type=int,
-    default=None,
-    help="Number of warmup steps (uses warmup-ratio if not specified)",
-)
-@click.option(
-    "--warmup-ratio",
-    type=float,
-    default=0.1,
-    help="Warmup ratio (fraction of total steps)",
-)
-@click.option(
-    "--max-length",
-    type=int,
-    default=512,
-    help="Maximum sequence length",
-)
-@click.option(
-    "--mlm-probability",
-    type=float,
-    default=0.20,
-    help="Masked language modeling probability",
-)
-@click.option(
-    "--max-files",
-    type=int,
-    default=None,
-    help="Maximum number of files to load",
-)
-@click.option(
-    "--chunk-size",
-    type=int,
-    default=4096,
-    help="Size of chunks to read from binary files",
-)
-@click.option(
-    "--num-workers",
-    type=int,
-    default=4,
-    help="Number of data loading workers",
-)
-@click.option(
-    "--mixed-precision/--no-mixed-precision",
-    default=True,
-    help="Use mixed precision training",
-)
-@click.option(
-    "--gradient-checkpointing",
-    is_flag=True,
-    default=False,
-    help="Enable gradient checkpointing (reduces VRAM at some speed cost)",
-)
-@click.option(
-    "--gradient-accumulation-steps",
-    type=int,
-    default=None,
-    help="Gradient accumulation steps (auto-selected based on model size if not specified)",
-)
-@click.option(
-    "--max-grad-norm",
-    type=float,
-    default=1.0,
-    help="Maximum gradient norm for clipping (default: 1.0)",
-)
-@click.option(
-    "--use-adaptive-grad-clip",
-    is_flag=True,
-    default=False,
-    help="Use adaptive gradient clipping based on percentile of recent gradients",
-)
-@click.option(
-    "--grad-clip-percentile",
-    type=float,
-    default=95.0,
-    help="Percentile of recent gradients to use for clipping (default: 95.0)",
-)
-@click.option(
-    "--grad-clip-history-size",
-    type=int,
-    default=100,
-    help="Number of steps to track for gradient percentile (default: 100)",
-)
-@click.option(
-    "--grad-clip-initial-threshold",
-    type=float,
-    default=10.0,
-    help="Initial gradient clipping threshold for first N steps (default: 10.0)",
-)
-@click.option(
-    "--early-stopping/--no-early-stopping",
-    default=False,
-    help="Use early stopping",
-)
-@click.option(
-    "--monitor-embedding/--no-monitor-embedding",
-    default=False,
-    help="Monitor embedding quality during training",
-)
-@click.option(
-    "--save-steps",
-    type=int,
-    default=1000,
-    help="Save checkpoint every N steps",
-)
-@click.option(
-    "--save-total-limit",
-    type=int,
-    default=None,
-    help="Maximum number of checkpoints to keep",
-)
-@click.option(
-    "--save-best-only/--save-all",
-    default=False,
-    help="Only save best checkpoint (requires validation)",
-)
-@click.option(
-    "--eval-steps",
-    type=int,
-    default=500,
-    help="Evaluate every N steps",
-)
-@click.option(
-    "--logging-steps",
-    type=int,
-    default=10,
-    help="Log metrics every N steps",
-)
-@click.option(
-    "--resume-from-checkpoint",
-    type=click.Path(exists=True, path_type=Path),
-    default=None,
-    help="Resume training from a checkpoint directory",
-)
-@click.option(
-    "--run-assessment/--no-assessment",
-    default=False,
-    help="Run periodic assessments during training",
-)
-@click.option(
-    "--assessment-steps",
-    type=int,
-    default=10000,
-    help="Run assessment every N steps",
-)
-@click.option(
-    "--use-wandb/--no-wandb",
-    default=True,
-    help="Use Weights & Biases for logging",
-)
-@click.option(
-    "--wandb-project",
-    type=str,
-    default="binary-embedding",
-    help="WandB project name",
-)
-@click.option(
-    "--wandb-run-name",
-    type=str,
-    default=None,
-    help="WandB run name (auto-generated if not specified)",
-)
-@click.option(
-    "--wandb-tags",
-    type=str,
-    multiple=True,
-    default=None,
-    help="WandB tags (can be specified multiple times)",
-)
-@click.option(
-    "--wandb-notes",
-    type=str,
-    default=None,
-    help="WandB run notes",
-)
-@click.option(
-    "--streaming/--no-streaming",
-    default=False,
-    help="Use streaming dataset (background IO); recommended for network storage",
-)
-@click.option(
-    "--contrastive/--no-contrastive",
-    default=False,
-    help="Enable contrastive training with pair sampling",
-)
-@click.option(
-    "--pooling",
-    type=click.Choice(["mean", "cls"]),
-    default="mean",
-    help="Embedding pooling method for contrastive loss",
-)
-@click.option(
-    "--dup-prob",
-    type=float,
-    default=0.5,
-    help="Probability of duplicate-view pairs within a file",
-)
-@click.option(
-    "--pair-cache-size",
-    type=int,
-    default=4096,
-    help="LRU cache size (number of chunks) for pair dataset",
-)
-@click.option(
-    "--prefetch-factor",
-    type=int,
-    default=4,
-    help="DataLoader prefetch_factor (per worker) for pair dataset",
-)
-@click.option(
-    "--min-chunk-separation",
-    type=int,
-    default=None,
-    help="Minimum byte separation between chunks for same-file pairs (default: chunk-size)",
-)
-@click.option(
-    "--contrastive-temp",
-    type=float,
-    default=0.07,
-    help="Contrastive temperature",
-)
-@click.option(
-    "--mlm-weight",
-    type=float,
-    default=1.0,
-    help="Weight for MLM loss",
-)
-@click.option(
-    "--view-weight",
-    type=float,
-    default=0.5,
-    help="Weight for duplicate-view contrastive loss",
-)
-@click.option(
-    "--samefile-weight",
-    type=float,
-    default=0.5,
-    help="Weight for same-file contrastive loss",
-)
-@click.option(
-    "--contrastive-ramp-steps",
-    type=int,
-    default=0,
-    help="Linear ramp-in steps for contrastive loss weights",
-)
-@click.option(
-    "--enable-entropy-filtering",
-    is_flag=True,
-    default=False,
-    help="Enable entropy-based chunk filtering",
-)
-@click.option(
-    "--entropy-bins",
-    type=str,
-    default="0,1.0,3.0,6.0,7.5,8.0",
-    help="Comma-separated entropy bin thresholds",
-)
-@click.option(
-    "--entropy-weights",
-    type=str,
-    default="0.1,0.5,2.0,1.0,0.3",
-    help="Comma-separated sampling weights for each entropy bin",
-)
-def train(
+def common_training_options(func):
+    options = [
+        click.option(
+            "--model-size",
+            type=click.Choice(["nano", "micro", "small", "medium", "base", "large"]),
+            default="small",
+            help="Model size to train",
+        ),
+        click.option(
+            "--model-type",
+            type=click.Choice(["bert", "roberta"]),
+            default="roberta",
+            help="Model architecture type",
+        ),
+        click.option(
+            "--data-dir",
+            type=click.Path(exists=True, path_type=Path),
+            default="/usr/bin",
+            help="Directory containing binary files",
+        ),
+        click.option(
+            "--tokenizer-path",
+            type=str,
+            default=None,
+            help="Path to tokenizer.json file or HuggingFace Hub repo (e.g., 'username/repo')",
+        ),
+        click.option(
+            "--output-dir",
+            type=click.Path(path_type=Path),
+            default="./output",
+            help="Output directory for checkpoints",
+        ),
+        click.option(
+            "--batch-size",
+            type=int,
+            default=None,
+            help="Per-device batch size (auto-selected based on model size if not specified)",
+        ),
+        click.option(
+            "--num-epochs",
+            type=int,
+            default=3,
+            help="Number of training epochs",
+        ),
+        click.option(
+            "--max-steps",
+            type=int,
+            default=None,
+            help="Maximum training steps (overrides num-epochs if set)",
+        ),
+        click.option(
+            "--learning-rate",
+            type=float,
+            default=None,
+            help="Learning rate (auto-selected based on model size if not specified)",
+        ),
+        click.option(
+            "--weight-decay",
+            type=float,
+            default=None,
+            help="Weight decay for AdamW optimizer (default: 0.0001)",
+        ),
+        click.option(
+            "--scheduler-type",
+            type=click.Choice(
+                ["linear", "cosine", "cosine_with_restarts", "two_phase", "polynomial", "trapezoidal"]
+            ),
+            default=None,
+            help="Learning rate scheduler type (auto-selected based on model size if not specified)",
+        ),
+        click.option(
+            "--warmup-steps",
+            type=int,
+            default=None,
+            help="Number of warmup steps (uses warmup-ratio if not specified)",
+        ),
+        click.option(
+            "--warmup-ratio",
+            type=float,
+            default=0.1,
+            help="Warmup ratio (fraction of total steps)",
+        ),
+        click.option(
+            "--plateau-ratio",
+            type=float,
+            default=0.6,
+            help="Plateau ratio for trapezoidal scheduler (fraction of non-warmup steps at peak LR)",
+        ),
+        click.option(
+            "--max-length",
+            type=int,
+            default=512,
+            help="Maximum sequence length",
+        ),
+        click.option(
+            "--mlm-probability",
+            type=float,
+            default=0.20,
+            help="Masked language modeling probability",
+        ),
+        click.option(
+            "--max-files",
+            type=int,
+            default=None,
+            help="Maximum number of files to load",
+        ),
+        click.option(
+            "--chunk-size",
+            type=int,
+            default=4096,
+            help="Size of chunks to read from binary files",
+        ),
+        click.option(
+            "--num-workers",
+            type=int,
+            default=4,
+            help="Number of data loading workers",
+        ),
+        click.option(
+            "--mixed-precision/--no-mixed-precision",
+            default=True,
+            help="Use mixed precision training",
+        ),
+        click.option(
+            "--gradient-checkpointing",
+            is_flag=True,
+            default=False,
+            help="Enable gradient checkpointing (reduces VRAM at some speed cost)",
+        ),
+        click.option(
+            "--gradient-accumulation-steps",
+            type=int,
+            default=None,
+            help="Gradient accumulation steps (auto-selected based on model size if not specified)",
+        ),
+        click.option(
+            "--max-grad-norm",
+            type=float,
+            default=2.0,
+            help="Maximum gradient norm for clipping (default: 2.0)",
+        ),
+        click.option(
+            "--use-adaptive-grad-clip",
+            is_flag=True,
+            default=False,
+            help="Use adaptive gradient clipping based on percentile of recent gradients",
+        ),
+        click.option(
+            "--grad-clip-percentile",
+            type=float,
+            default=95.0,
+            help="Percentile of recent gradients to use for clipping (default: 95.0)",
+        ),
+        click.option(
+            "--grad-clip-history-size",
+            type=int,
+            default=100,
+            help="Number of steps to track for gradient percentile (default: 100)",
+        ),
+        click.option(
+            "--grad-clip-initial-threshold",
+            type=float,
+            default=10.0,
+            help="Initial gradient clipping threshold for first N steps (default: 10.0)",
+        ),
+        click.option(
+            "--early-stopping/--no-early-stopping",
+            default=False,
+            help="Use early stopping",
+        ),
+        click.option(
+            "--monitor-embedding/--no-monitor-embedding",
+            default=False,
+            help="Monitor embedding quality during training",
+        ),
+        click.option(
+            "--save-steps",
+            type=int,
+            default=1000,
+            help="Save checkpoint every N steps",
+        ),
+        click.option(
+            "--save-total-limit",
+            type=int,
+            default=5,
+            help="Maximum number of checkpoints to keep (default: 5)",
+        ),
+        click.option(
+            "--save-best-only/--save-all",
+            default=False,
+            help="Only save best checkpoint (requires validation)",
+        ),
+        click.option(
+            "--eval-steps",
+            type=int,
+            default=500,
+            help="Evaluate every N steps",
+        ),
+        click.option(
+            "--logging-steps",
+            type=int,
+            default=10,
+            help="Log metrics every N steps",
+        ),
+        click.option(
+            "--jsonl-logging/--no-jsonl-logging",
+            default=True,
+            help="Write detailed diagnostics to a local JSONL file",
+        ),
+        click.option(
+            "--jsonl-log-path",
+            type=click.Path(path_type=Path),
+            default=None,
+            help="Optional override for JSONL diagnostics output path",
+        ),
+        click.option(
+            "--jsonl-log-frequency",
+            type=int,
+            default=1,
+            help="Number of optimizer steps between JSONL log entries",
+        ),
+        click.option(
+            "--init-from-checkpoint",
+            type=click.Path(exists=True, path_type=Path),
+            default=None,
+            help="Initialize model weights from an existing checkpoint",
+        ),
+        click.option(
+            "--resume-from-checkpoint",
+            type=click.Path(exists=True, path_type=Path),
+            default=None,
+            help="Resume training from a checkpoint directory",
+        ),
+        click.option(
+            "--run-assessment/--no-assessment",
+            default=True,
+            help="Run periodic assessments during training",
+        ),
+        click.option(
+            "--assessment-steps",
+            type=int,
+            default=1000,
+            help="Run assessment every N steps",
+        ),
+        click.option(
+            "--use-wandb/--no-wandb",
+            default=True,
+            help="Use Weights & Biases for logging",
+        ),
+        click.option(
+            "--wandb-project",
+            type=str,
+            default="binary-embedding",
+            help="WandB project name",
+        ),
+        click.option(
+            "--wandb-run-name",
+            type=str,
+            default=None,
+            help="WandB run name (auto-generated if not specified)",
+        ),
+        click.option(
+            "--wandb-tags",
+            type=str,
+            multiple=True,
+            default=None,
+            help="WandB tags (can be specified multiple times)",
+        ),
+        click.option(
+            "--wandb-notes",
+            type=str,
+            default=None,
+            help="WandB run notes",
+        ),
+        click.option(
+            "--streaming/--no-streaming",
+            default=False,
+            help="Use streaming dataset (background IO); recommended for network storage",
+        ),
+        click.option(
+            "--enable-entropy-filtering",
+            is_flag=True,
+            default=False,
+            help="Enable entropy-based chunk filtering",
+        ),
+        click.option(
+            "--entropy-bins",
+            type=str,
+            default="0,1.0,3.0,6.0,7.5,8.0",
+            help="Comma-separated entropy bin thresholds",
+        ),
+        click.option(
+            "--entropy-weights",
+            type=str,
+            default="0.1,0.5,2.0,1.0,0.3",
+            help="Comma-separated sampling weights for each entropy bin",
+        ),
+    ]
+    for option in reversed(options):
+        func = option(func)
+    return func
+
+
+def contrastive_training_options(func):
+    options = [
+        click.option(
+            "--pooling",
+            type=click.Choice(["mean", "cls"]),
+            default="mean",
+            help="Embedding pooling method for contrastive loss",
+        ),
+        click.option(
+            "--dup-prob",
+            type=float,
+            default=0.5,
+            help="Probability of duplicate-view pairs within a file",
+        ),
+        click.option(
+            "--pair-cache-size",
+            type=int,
+            default=4096,
+            help="LRU cache size (number of chunks) for pair dataset",
+        ),
+        click.option(
+            "--prefetch-factor",
+            type=int,
+            default=4,
+            help="DataLoader prefetch_factor (per worker) for pair dataset",
+        ),
+        click.option(
+            "--min-chunk-separation",
+            type=int,
+            default=None,
+            help="Minimum byte separation between chunks for same-file pairs (default: chunk-size)",
+        ),
+        click.option(
+            "--contrastive-temp",
+            type=float,
+            default=0.07,
+            help="Contrastive temperature",
+        ),
+        click.option(
+            "--mlm-weight",
+            type=float,
+            default=1.0,
+            help="Weight for MLM loss",
+        ),
+        click.option(
+            "--view-weight",
+            type=float,
+            default=0.5,
+            help="Weight for duplicate-view contrastive loss",
+        ),
+        click.option(
+            "--samefile-weight",
+            type=float,
+            default=0.5,
+            help="Weight for same-file contrastive loss",
+        ),
+        click.option(
+            "--contrastive-ramp-steps",
+            type=int,
+            default=0,
+            help="Linear ramp-in steps for contrastive loss weights",
+        ),
+    ]
+    for option in reversed(options):
+        func = option(func)
+    return func
+
+
+@cli.command(name="mlm-pretrain")
+@common_training_options
+def mlm_pretrain(
     model_size: str,
     model_type: str,
     data_dir: Path,
-    tokenizer_path: Path | None,
+    tokenizer_path: str | None,
     output_dir: Path,
     batch_size: int | None,
     num_epochs: int,
     max_steps: int | None,
     learning_rate: float | None,
+    weight_decay: float | None,
     scheduler_type: str | None,
     warmup_steps: int | None,
     warmup_ratio: float,
+    plateau_ratio: float,
     max_length: int,
     mlm_probability: float,
     max_files: int | None,
@@ -389,6 +442,10 @@ def train(
     save_best_only: bool,
     eval_steps: int,
     logging_steps: int,
+    jsonl_logging: bool,
+    jsonl_log_path: Path | None,
+    jsonl_log_frequency: int,
+    init_from_checkpoint: Path | None,
     resume_from_checkpoint: Path | None,
     run_assessment: bool,
     assessment_steps: int,
@@ -398,32 +455,22 @@ def train(
     wandb_tags: tuple[str, ...] | None,
     wandb_notes: str | None,
     streaming: bool,
-    contrastive: bool,
-    pooling: str,
-    dup_prob: float,
-    pair_cache_size: int,
-    prefetch_factor: int,
-    min_chunk_separation: int | None,
-    contrastive_temp: float,
-    mlm_weight: float,
-    view_weight: float,
-    samefile_weight: float,
-    contrastive_ramp_steps: int,
     enable_entropy_filtering: bool,
     entropy_bins: str,
     entropy_weights: str,
 ) -> None:
-    """Train a binary embedding model with optional advanced features."""
-    # Display configuration
+    """Run the MLM pretraining stage."""
+    if jsonl_log_frequency < 1:
+        raise click.BadParameter(
+            "--jsonl-log-frequency must be >= 1",
+            param_hint="--jsonl-log-frequency",
+        )
     console.print(
         Panel.fit(
-            "[bold cyan]Binary Embedding Model Training[/bold cyan]\n"
-            "[dim]Using optimized hyperparameters for best results[/dim]",
+            "[bold cyan]Binary Embedding MLM Pretraining[/bold cyan]",
             border_style="cyan",
         )
     )
-
-    # Create config based on model size with user overrides
     base_config = TrainerConfig.from_model_size(
         model_size,
         output_dir=str(output_dir),
@@ -445,12 +492,12 @@ def train(
         wandb_tags=list(wandb_tags) if wandb_tags else None,
         wandb_notes=wandb_notes,
     )
-
-    # Apply user overrides
     if batch_size is not None:
         base_config.batch_size = batch_size
     if learning_rate is not None:
         base_config.learning_rate = learning_rate
+    if weight_decay is not None:
+        base_config.weight_decay = weight_decay
     if max_steps is not None:
         base_config.max_steps = max_steps
     if gradient_accumulation_steps is not None:
@@ -462,16 +509,19 @@ def train(
     base_config.grad_clip_percentile = grad_clip_percentile
     base_config.grad_clip_history_size = grad_clip_history_size
     base_config.grad_clip_initial_threshold = grad_clip_initial_threshold
+    base_config.enable_jsonl_logging = jsonl_logging
+    base_config.jsonl_log_path = str(jsonl_log_path) if jsonl_log_path else None
+    base_config.jsonl_log_frequency = jsonl_log_frequency
     if warmup_steps is not None:
         base_config.warmup_steps = warmup_steps
+    if plateau_ratio is not None:
+        base_config.plateau_ratio = plateau_ratio
     if gradient_checkpointing:
         base_config.gradient_checkpointing = True
-
-    # Display configuration table
     config_table = Table(title="Training Configuration", show_header=False)
     config_table.add_column("Parameter", style="dim")
     config_table.add_column("Value", style="green")
-
+    config_table.add_row("Stage", "MLM Pretraining")
     config_table.add_row("Model Size", model_size)
     config_table.add_row("Model Type", model_type)
     config_table.add_row("Data Directory", str(data_dir))
@@ -485,8 +535,11 @@ def train(
     )
     config_table.add_row("Learning Rate", f"{base_config.learning_rate:.2e}")
     if use_adaptive_grad_clip:
+        clip_desc = f"{grad_clip_percentile:.0f}%ile"
+        if max_grad_norm > 0:
+            clip_desc += f", max {max_grad_norm:.1f}"
         config_table.add_row(
-            "Adaptive Grad Clip", f"✓ ({grad_clip_percentile:.0f}%ile)"
+            "Adaptive Grad Clip", f"✓ ({clip_desc})"
         )
     else:
         config_table.add_row("Max Grad Norm", f"{max_grad_norm:.1f}")
@@ -511,49 +564,40 @@ def train(
         config_table.add_row("Periodic Assessment", f"Every {assessment_steps:,} steps")
     if use_wandb:
         config_table.add_row("WandB Logging", f"Project: {wandb_project}")
-    config_table.add_row("Output Directory", str(output_dir))
-    if contrastive:
-        config_table.add_row("Contrastive", "✓")
-        config_table.add_row("Pooling", pooling)
-        config_table.add_row("Dup Pair Prob", f"{dup_prob:.2f}")
-        config_table.add_row("Pair Cache Size", str(pair_cache_size))
-        config_table.add_row("Prefetch Factor", str(prefetch_factor))
-        if min_chunk_separation is not None:
-            config_table.add_row("Min Chunk Sep", str(min_chunk_separation))
-        config_table.add_row("Ctr Temp", f"{contrastive_temp:.2f}")
-        config_table.add_row(
-            "Loss Weights",
-            f"MLM={mlm_weight}, View={view_weight}, SameFile={samefile_weight}",
+    if jsonl_logging:
+        stage_name = "mlm"
+        default_path = (
+            str(jsonl_log_path)
+            if jsonl_log_path
+            else str(output_dir / f"{stage_name}_training_log.jsonl")
         )
+        config_table.add_row(
+            "JSONL Diagnostics",
+            f"✓ every {jsonl_log_frequency} step(s) → {default_path}",
+        )
+    else:
+        config_table.add_row("JSONL Diagnostics", "✗")
+    if init_from_checkpoint:
+        config_table.add_row("Init From", str(init_from_checkpoint))
+    if resume_from_checkpoint:
+        config_table.add_row("Resume From", str(resume_from_checkpoint))
+    config_table.add_row("Output Directory", str(output_dir))
     if enable_entropy_filtering:
         config_table.add_row("Entropy Filtering", "✓")
-
     console.print(config_table)
     console.print()
-
-    # Check device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     console.print(f"[yellow]Using device: {device}[/yellow]\n")
-
-    # Load tokenizer
     with console.status("[bold green]Loading tokenizer..."):
         tokenizer = load_tokenizer(tokenizer_path)
         console.print(f"✓ Tokenizer loaded (vocab size: {tokenizer.vocab_size:,})")
-
-    # Create or load model
-    if resume_from_checkpoint:
-        with console.status(
-            f"[bold green]Loading model from {resume_from_checkpoint}..."
-        ):
+    load_path = resume_from_checkpoint or init_from_checkpoint
+    if load_path:
+        with console.status(f"[bold green]Loading model from {load_path}..."):
             from transformers import AutoConfig, AutoModelForMaskedLM
 
-            # Load model config
-            config = AutoConfig.from_pretrained(resume_from_checkpoint)
-            model = AutoModelForMaskedLM.from_pretrained(resume_from_checkpoint)
-
-            # Create model_config for compatibility
-            from binary_embedding.models import BinaryEmbeddingConfig
-
+            config = AutoConfig.from_pretrained(load_path)
+            model = AutoModelForMaskedLM.from_pretrained(load_path)
             model_config = BinaryEmbeddingConfig(
                 vocab_size=config.vocab_size,
                 hidden_size=config.hidden_size,
@@ -566,11 +610,8 @@ def train(
                 warmup_steps=base_config.warmup_steps or int(warmup_ratio * 10000),
                 mlm_probability=mlm_probability,
             )
-
             total_params = sum(p.numel() for p in model.parameters())
-            console.print(
-                f"✓ Model loaded from checkpoint ({total_params:,} parameters)"
-            )
+            console.print(f"✓ Model loaded ({total_params:,} parameters)")
     else:
         with console.status(f"[bold green]Creating {model_size} model..."):
             size_enum = ModelSize(model_size)
@@ -581,101 +622,36 @@ def train(
                 warmup_ratio * 10000
             )
             model_config.mlm_probability = mlm_probability
-
             total_params = sum(p.numel() for p in model.parameters())
             console.print(f"✓ Model created ({total_params:,} parameters)")
-
-    # Create entropy filter if enabled
     entropy_filter = None
     if enable_entropy_filtering:
-        # Parse entropy bins and weights from comma-separated strings
         bins = [float(x.strip()) for x in entropy_bins.split(",")]
         weights = [float(x.strip()) for x in entropy_weights.split(",")]
         entropy_filter = EntropyFilter(entropy_bins=bins, sampling_weights=weights)
         console.print("[yellow]Entropy filtering enabled[/yellow]")
         console.print(f"  Bins: {bins}")
         console.print(f"  Weights: {weights}")
-
-    # Create data loader
     with console.status(f"[bold green]Loading data from {data_dir}..."):
-        if contrastive:
-            if streaming:
-                train_dataloader = create_streaming_pair_dataloader(
-                    directory_path=data_dir,
-                    tokenizer=tokenizer,
-                    batch_size=base_config.batch_size,
-                    max_length=max_length,
-                    chunk_size=chunk_size,
-                    mlm_probability=mlm_probability,
-                    duplicate_prob=dup_prob,
-                    min_chunk_separation=min_chunk_separation
-                    if min_chunk_separation is not None
-                    else chunk_size,
-                    buffer_size=pair_cache_size,
-                    per_file_buffer=32,
-                    num_workers=num_workers,
-                    shuffle=True,
-                    cycle=True,
-                    enable_entropy_filtering=enable_entropy_filtering,
-                    entropy_filter=entropy_filter,
-                )
-            else:
-                train_dataloader = create_pair_dataloader(
-                    directory_path=data_dir,
-                    tokenizer=tokenizer,
-                    batch_size=base_config.batch_size,
-                    max_length=max_length,
-                    chunk_size=chunk_size,
-                    mlm_probability=mlm_probability,
-                    duplicate_prob=dup_prob,
-                    min_chunk_separation=min_chunk_separation
-                    if min_chunk_separation is not None
-                    else chunk_size,
-                    num_workers=num_workers,
-                    max_files=max_files,
-                    cache_size=pair_cache_size,
-                    prefetch_factor=prefetch_factor,
-                    tokenize_in_dataset=False,
-                    enable_entropy_filtering=enable_entropy_filtering,
-                    entropy_filter=entropy_filter,
-                )
-        else:
-            train_dataloader = create_dataloader(
-                directory_path=data_dir,
-                tokenizer=tokenizer,
-                batch_size=base_config.batch_size,
-                max_length=max_length,
-                chunk_size=chunk_size,
-                mlm_probability=mlm_probability,
-                num_workers=num_workers,
-                max_files=max_files,
-                streaming=streaming,
-                enable_entropy_filtering=enable_entropy_filtering,
-                entropy_filter=entropy_filter,
-            )
-        # len() not defined for streaming IterableDatasets
+        train_dataloader = create_dataloader(
+            directory_path=data_dir,
+            tokenizer=tokenizer,
+            batch_size=base_config.batch_size,
+            max_length=max_length,
+            chunk_size=chunk_size,
+            mlm_probability=mlm_probability,
+            num_workers=num_workers,
+            max_files=max_files,
+            streaming=streaming,
+            enable_entropy_filtering=enable_entropy_filtering,
+            entropy_filter=entropy_filter,
+        )
         try:
             num_batches = len(train_dataloader)
             console.print(f"✓ Data loaded ({num_batches} batches)")
         except TypeError:
             console.print("✓ Data loaded (streaming)")
-
-    # Create trainer
-    # Configure contrastive options on the config
-    if contrastive:
-        base_config.contrastive_enabled = True
-        base_config.pooling = pooling
-        base_config.contrastive_temperature = contrastive_temp
-        base_config.mlm_weight = mlm_weight
-        base_config.view_contrastive_weight = view_weight
-        base_config.same_file_contrastive_weight = samefile_weight
-        base_config.contrastive_ramp_steps = contrastive_ramp_steps
-        base_config.duplicate_pair_probability = dup_prob
-        base_config.min_chunk_separation = (
-            min_chunk_separation if min_chunk_separation is not None else chunk_size
-        )
-
-    trainer = Trainer(
+    trainer = MLMTrainer(
         model=model,
         tokenizer=tokenizer,
         train_dataloader=train_dataloader,
@@ -683,13 +659,308 @@ def train(
         model_config=model_config,
         resume_from_checkpoint=resume_from_checkpoint,
     )
-
-    # Train
-    console.print("\n[bold green]Starting training...[/bold green]\n")
+    console.print("\n[bold green]Starting MLM pretraining...[/bold green]\n")
     trainer.train()
-
     console.print(
-        f"\n[bold green]✓ Training complete! Model saved to {output_dir}[/bold green]"
+        f"\n[bold green]✓ Pretraining complete! Model saved to {output_dir}[/bold green]"
+    )
+
+
+@cli.command(name="contrastive-train")
+@common_training_options
+@contrastive_training_options
+def contrastive_train(
+    model_size: str,
+    model_type: str,
+    data_dir: Path,
+    tokenizer_path: str | None,
+    output_dir: Path,
+    batch_size: int | None,
+    num_epochs: int,
+    max_steps: int | None,
+    learning_rate: float | None,
+    weight_decay: float | None,
+    scheduler_type: str | None,
+    warmup_steps: int | None,
+    warmup_ratio: float,
+    plateau_ratio: float,
+    max_length: int,
+    mlm_probability: float,
+    max_files: int | None,
+    chunk_size: int,
+    num_workers: int,
+    mixed_precision: bool,
+    gradient_checkpointing: bool,
+    gradient_accumulation_steps: int | None,
+    max_grad_norm: float,
+    use_adaptive_grad_clip: bool,
+    grad_clip_percentile: float,
+    grad_clip_history_size: int,
+    grad_clip_initial_threshold: float,
+    early_stopping: bool,
+    monitor_embedding: bool,
+    save_steps: int,
+    save_total_limit: int | None,
+    save_best_only: bool,
+    eval_steps: int,
+    logging_steps: int,
+    jsonl_logging: bool,
+    jsonl_log_path: Path | None,
+    jsonl_log_frequency: int,
+    init_from_checkpoint: Path | None,
+    resume_from_checkpoint: Path | None,
+    run_assessment: bool,
+    assessment_steps: int,
+    use_wandb: bool,
+    wandb_project: str,
+    wandb_run_name: str | None,
+    wandb_tags: tuple[str, ...] | None,
+    wandb_notes: str | None,
+    streaming: bool,
+    enable_entropy_filtering: bool,
+    entropy_bins: str,
+    entropy_weights: str,
+    pooling: str,
+    dup_prob: float,
+    pair_cache_size: int,
+    prefetch_factor: int,
+    min_chunk_separation: int | None,
+    contrastive_temp: float,
+    mlm_weight: float,
+    view_weight: float,
+    samefile_weight: float,
+    contrastive_ramp_steps: int,
+) -> None:
+    """Run the contrastive fine-tuning stage."""
+    if init_from_checkpoint is None:
+        raise click.UsageError(
+            "--init-from-checkpoint is required for contrastive training"
+        )
+    if jsonl_log_frequency < 1:
+        raise click.BadParameter(
+            "--jsonl-log-frequency must be >= 1",
+            param_hint="--jsonl-log-frequency",
+        )
+    console.print(
+        Panel.fit(
+            "[bold magenta]Binary Embedding Contrastive Training[/bold magenta]",
+            border_style="magenta",
+        )
+    )
+    base_config = TrainerConfig.from_model_size(
+        model_size,
+        output_dir=str(output_dir),
+        num_epochs=num_epochs,
+        warmup_ratio=warmup_ratio,
+        mixed_precision=mixed_precision,
+        use_early_stopping=early_stopping,
+        monitor_embedding_quality=monitor_embedding,
+        save_steps=save_steps,
+        save_total_limit=save_total_limit,
+        save_best_only=save_best_only,
+        eval_steps=eval_steps,
+        logging_steps=logging_steps,
+        run_assessment=run_assessment,
+        assessment_steps=assessment_steps,
+        use_wandb=use_wandb,
+        wandb_project=wandb_project,
+        wandb_run_name=wandb_run_name,
+        wandb_tags=list(wandb_tags) if wandb_tags else None,
+        wandb_notes=wandb_notes,
+    )
+    if batch_size is not None:
+        base_config.batch_size = batch_size
+    if learning_rate is not None:
+        base_config.learning_rate = learning_rate
+    if weight_decay is not None:
+        base_config.weight_decay = weight_decay
+    if max_steps is not None:
+        base_config.max_steps = max_steps
+    if gradient_accumulation_steps is not None:
+        base_config.gradient_accumulation_steps = gradient_accumulation_steps
+    if scheduler_type is not None:
+        base_config.scheduler_type = scheduler_type
+    base_config.max_grad_norm = max_grad_norm
+    base_config.use_adaptive_grad_clip = use_adaptive_grad_clip
+    base_config.grad_clip_percentile = grad_clip_percentile
+    base_config.grad_clip_history_size = grad_clip_history_size
+    base_config.grad_clip_initial_threshold = grad_clip_initial_threshold
+    if warmup_steps is not None:
+        base_config.warmup_steps = warmup_steps
+    if plateau_ratio is not None:
+        base_config.plateau_ratio = plateau_ratio
+    if gradient_checkpointing:
+        base_config.gradient_checkpointing = True
+    base_config.pooling = pooling
+    base_config.duplicate_pair_probability = dup_prob
+    base_config.contrastive_temperature = contrastive_temp
+    base_config.mlm_weight = mlm_weight
+    base_config.view_contrastive_weight = view_weight
+    base_config.same_file_contrastive_weight = samefile_weight
+    base_config.contrastive_ramp_steps = contrastive_ramp_steps
+    base_config.min_chunk_separation = (
+        min_chunk_separation if min_chunk_separation is not None else chunk_size
+    )
+    config_table = Table(title="Training Configuration", show_header=False)
+    config_table.add_column("Parameter", style="dim")
+    config_table.add_column("Value", style="green")
+    config_table.add_row("Stage", "Contrastive Fine-tuning")
+    config_table.add_row("Model Size", model_size)
+    config_table.add_row("Model Type", model_type)
+    config_table.add_row("Data Directory", str(data_dir))
+    config_table.add_row("Batch Size", str(base_config.batch_size))
+    config_table.add_row(
+        "Gradient Accumulation", str(base_config.gradient_accumulation_steps)
+    )
+    config_table.add_row(
+        "Effective Batch Size",
+        str(base_config.batch_size * base_config.gradient_accumulation_steps),
+    )
+    config_table.add_row("Learning Rate", f"{base_config.learning_rate:.2e}")
+    if use_adaptive_grad_clip:
+        clip_desc = f"{grad_clip_percentile:.0f}%ile"
+        if max_grad_norm > 0:
+            clip_desc += f", max {max_grad_norm:.1f}"
+        config_table.add_row(
+            "Adaptive Grad Clip", f"✓ ({clip_desc})"
+        )
+    else:
+        config_table.add_row("Max Grad Norm", f"{max_grad_norm:.1f}")
+    config_table.add_row("Scheduler", base_config.scheduler_type)
+    config_table.add_row(
+        "Warmup",
+        f"{warmup_ratio:.1%}" if warmup_steps is None else f"{warmup_steps} steps",
+    )
+    config_table.add_row("Epochs", str(num_epochs))
+    if max_steps:
+        config_table.add_row("Max Steps", str(max_steps))
+    config_table.add_row("Max Length", str(max_length))
+    config_table.add_row("MLM Probability", f"{mlm_probability:.2%}")
+    config_table.add_row("Pooling", pooling)
+    config_table.add_row("Dup Pair Prob", f"{dup_prob:.2f}")
+    config_table.add_row("Ctr Temp", f"{contrastive_temp:.2f}")
+    config_table.add_row(
+        "Loss Weights",
+        f"MLM={mlm_weight}, View={view_weight}, SameFile={samefile_weight}",
+    )
+    if contrastive_ramp_steps:
+        config_table.add_row("Ramp Steps", str(contrastive_ramp_steps))
+    config_table.add_row("Mixed Precision", "✓" if mixed_precision else "✗")
+    if gradient_checkpointing:
+        config_table.add_row("Gradient Checkpointing", "✓")
+    if early_stopping:
+        config_table.add_row("Early Stopping", "✓")
+    if monitor_embedding:
+        config_table.add_row("Embedding Monitoring", "✓")
+    if run_assessment:
+        config_table.add_row("Periodic Assessment", f"Every {assessment_steps:,} steps")
+    if use_wandb:
+        config_table.add_row("WandB Logging", f"Project: {wandb_project}")
+    if jsonl_logging:
+        stage_name = "contrastive"
+        default_path = (
+            str(jsonl_log_path)
+            if jsonl_log_path
+            else str(output_dir / f"{stage_name}_training_log.jsonl")
+        )
+        config_table.add_row(
+            "JSONL Diagnostics",
+            f"✓ every {jsonl_log_frequency} step(s) → {default_path}",
+        )
+    else:
+        config_table.add_row("JSONL Diagnostics", "✗")
+    config_table.add_row("Init From", str(init_from_checkpoint))
+    if resume_from_checkpoint:
+        config_table.add_row("Resume From", str(resume_from_checkpoint))
+    config_table.add_row("Output Directory", str(output_dir))
+    if enable_entropy_filtering:
+        config_table.add_row("Entropy Filtering", "✓")
+    console.print(config_table)
+    console.print()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    console.print(f"[yellow]Using device: {device}[/yellow]\n")
+    with console.status("[bold green]Loading tokenizer..."):
+        tokenizer = load_tokenizer(tokenizer_path)
+        console.print(f"✓ Tokenizer loaded (vocab size: {tokenizer.vocab_size:,})")
+    with console.status(f"[bold green]Loading model from {init_from_checkpoint}..."):
+        from transformers import AutoConfig, AutoModelForMaskedLM
+
+        config = AutoConfig.from_pretrained(init_from_checkpoint)
+        model = AutoModelForMaskedLM.from_pretrained(init_from_checkpoint)
+        model_config = BinaryEmbeddingConfig(
+            vocab_size=config.vocab_size,
+            hidden_size=config.hidden_size,
+            num_hidden_layers=config.num_hidden_layers,
+            num_attention_heads=config.num_attention_heads,
+            intermediate_size=config.intermediate_size,
+            max_position_embeddings=config.max_position_embeddings,
+            model_type=model_type,
+            learning_rate=base_config.learning_rate,
+            warmup_steps=base_config.warmup_steps or int(warmup_ratio * 10000),
+            mlm_probability=mlm_probability,
+        )
+        total_params = sum(p.numel() for p in model.parameters())
+        console.print(f"✓ Model loaded ({total_params:,} parameters)")
+    entropy_filter = None
+    if enable_entropy_filtering:
+        bins = [float(x.strip()) for x in entropy_bins.split(",")]
+        weights = [float(x.strip()) for x in entropy_weights.split(",")]
+        entropy_filter = EntropyFilter(entropy_bins=bins, sampling_weights=weights)
+        console.print("[yellow]Entropy filtering enabled[/yellow]")
+        console.print(f"  Bins: {bins}")
+        console.print(f"  Weights: {weights}")
+    with console.status(f"[bold green]Loading pair data from {data_dir}..."):
+        if streaming:
+            train_dataloader = create_streaming_pair_dataloader(
+                directory_path=data_dir,
+                tokenizer=tokenizer,
+                batch_size=base_config.batch_size,
+                max_length=max_length,
+                chunk_size=chunk_size,
+                mlm_probability=mlm_probability,
+                duplicate_prob=dup_prob,
+                min_chunk_separation=base_config.min_chunk_separation,
+                buffer_size=pair_cache_size,
+                per_file_buffer=32,
+                num_workers=num_workers,
+                shuffle=True,
+                cycle=True,
+                enable_entropy_filtering=enable_entropy_filtering,
+                entropy_filter=entropy_filter,
+            )
+            console.print("✓ Data loaded (streaming pairs)")
+        else:
+            train_dataloader = create_pair_dataloader(
+                directory_path=data_dir,
+                tokenizer=tokenizer,
+                batch_size=base_config.batch_size,
+                max_length=max_length,
+                chunk_size=chunk_size,
+                mlm_probability=mlm_probability,
+                duplicate_prob=dup_prob,
+                min_chunk_separation=base_config.min_chunk_separation,
+                num_workers=num_workers,
+                max_files=max_files,
+                cache_size=pair_cache_size,
+                prefetch_factor=prefetch_factor,
+                tokenize_in_dataset=False,
+                enable_entropy_filtering=enable_entropy_filtering,
+                entropy_filter=entropy_filter,
+            )
+            num_batches = len(train_dataloader)
+            console.print(f"✓ Data loaded ({num_batches} batches)")
+    trainer = ContrastiveTrainer(
+        model=model,
+        tokenizer=tokenizer,
+        train_dataloader=train_dataloader,
+        config=base_config,
+        model_config=model_config,
+        resume_from_checkpoint=resume_from_checkpoint,
+    )
+    console.print("\n[bold green]Starting contrastive training...[/bold green]\n")
+    trainer.train()
+    console.print(
+        f"\n[bold green]✓ Contrastive training complete! Model saved to {output_dir}[/bold green]"
     )
 
 
@@ -702,9 +973,9 @@ def train(
 )
 @click.option(
     "--tokenizer-path",
-    type=click.Path(exists=True, path_type=Path),
+    type=str,
     default=None,
-    help="Path to tokenizer.json file",
+    help="Path to tokenizer.json file or HuggingFace Hub repo (e.g., 'username/repo')",
 )
 @click.option(
     "--text",
@@ -714,7 +985,7 @@ def train(
 )
 def test(
     checkpoint_path: Path,
-    tokenizer_path: Path | None,
+    tokenizer_path: str | None,
     text: str,
 ) -> None:
     """Test a trained model on a hex string."""
@@ -727,22 +998,17 @@ def test(
             border_style="magenta",
         )
     )
-
     # Load tokenizer
     tokenizer = load_tokenizer(tokenizer_path)
-
     # Load model
     model = AutoModelForMaskedLM.from_pretrained(checkpoint_path)
     model.eval()
-
     # Tokenize
     inputs = tokenizer(text, return_tensors="pt")
-
     # Get predictions
     with torch.no_grad():
         outputs = model(**inputs)
         logits = outputs.logits
-
     # Show results
     console.print(f"\n[cyan]Input text:[/cyan] {text}")
     console.print(f"[cyan]Token IDs:[/cyan] {inputs['input_ids'][0].tolist()}")
@@ -758,9 +1024,9 @@ def test(
 )
 @click.option(
     "--tokenizer-path",
-    type=click.Path(exists=True, path_type=Path),
+    type=str,
     default=None,
-    help="Path to tokenizer.json file",
+    help="Path to tokenizer.json file or HuggingFace Hub repo (e.g., 'username/repo')",
 )
 @click.option(
     "--output",
@@ -769,7 +1035,7 @@ def test(
 )
 def assess(
     checkpoint_path: Path,
-    tokenizer_path: Path | None,
+    tokenizer_path: str | None,
     output: Path | None,
 ) -> None:
     """Run comprehensive assessment on a trained model."""
@@ -779,30 +1045,23 @@ def assess(
             border_style="cyan",
         )
     )
-
     console.print(f"Checkpoint: {checkpoint_path}")
     if output:
         console.print(f"Output: {output}")
-
     console.print("\nRunning assessment tests...")
-
     # Run assessment
     suite = load_and_assess_model(checkpoint_path, tokenizer_path, output)
-
     # Display results
     results_table = Table(title="Assessment Results")
     results_table.add_column("Test", style="cyan")
     results_table.add_column("Status", justify="center")
     results_table.add_column("Score", justify="right")
-
     for result in suite.results:
         status = "[green]✓ PASS[/green]" if result.passed else "[red]✗ FAIL[/red]"
         score = f"{result.score:.1%}"
         results_table.add_row(result.test_name, status, score)
-
     console.print()
     console.print(results_table)
-
     # Summary
     summary = suite.get_summary()
     console.print()
@@ -845,12 +1104,10 @@ def assess_all(output_dir: Path, force: bool) -> None:
         if not output_dir.exists():
             console.print(f"[red]Error: {output_dir} directory not found[/red]")
             return []
-
         checkpoints = []
         for item in output_dir.iterdir():
             if item.is_dir() and item.name.startswith("checkpoint-"):
                 checkpoints.append(item)
-
         checkpoints.sort(key=get_checkpoint_number)
         return checkpoints
 
@@ -863,7 +1120,6 @@ def assess_all(output_dir: Path, force: bool) -> None:
         assessment_file = checkpoint_path / "assessment.json"
         if not assessment_file.exists():
             return None
-
         try:
             with open(assessment_file) as f:
                 return json.load(f)
@@ -891,15 +1147,12 @@ def assess_all(output_dir: Path, force: bool) -> None:
             border_style="cyan",
         )
     )
-
     # Find checkpoints
     checkpoints = find_checkpoints(output_dir)
     if not checkpoints:
         console.print("[red]No checkpoints found![/red]")
         return
-
     console.print(f"\n[cyan]Found {len(checkpoints)} checkpoints:[/cyan]")
-
     # Assess checkpoints that need it
     assessments_run = 0
     for cp in checkpoints:
@@ -908,16 +1161,14 @@ def assess_all(output_dir: Path, force: bool) -> None:
         else:
             status = "[green]✓ has assessment[/green]"
         console.print(f"  {cp.name} {status}")
-
     console.print()
-
     # Run assessments
     for cp in checkpoints:
         if force or not has_assessment(cp):
             console.print(f"[cyan]Assessing {cp.name}...[/cyan]")
             try:
                 os.environ["CUDA_VISIBLE_DEVICES"] = ""  # Use CPU
-                suite = load_and_assess_model(
+                load_and_assess_model(
                     checkpoint_path=cp,
                     tokenizer_path=None,
                     output_path=cp / "assessment.json",
@@ -925,10 +1176,8 @@ def assess_all(output_dir: Path, force: bool) -> None:
                 assessments_run += 1
             except Exception as e:
                 console.print(f"[red]Failed to assess {cp.name}: {e}[/red]")
-
     if assessments_run > 0:
         console.print(f"\n[green]Completed {assessments_run} assessments[/green]")
-
     # Load all assessments
     console.print("\n[cyan]Loading results...[/cyan]")
     assessments = {}
@@ -937,28 +1186,21 @@ def assess_all(output_dir: Path, force: bool) -> None:
         if assessment:
             num = get_checkpoint_number(cp)
             assessments[num] = assessment
-
     if not assessments:
         console.print("[red]No assessments could be loaded[/red]")
         return
-
     checkpoint_nums = sorted(assessments.keys())
-
     # Create comparison table
     table = Table(title="Checkpoint Comparison", show_lines=True)
     table.add_column("Metric", style="cyan")
-
     for num in checkpoint_nums:
         table.add_column(str(num), justify="right")
-
     # Add overall metrics
     pass_rates = []
     avg_scores = []
-
     for num in checkpoint_nums:
         pass_rates.append(assessments[num]["summary"]["pass_rate"] * 100)
         avg_scores.append(assessments[num]["summary"]["average_score"] * 100)
-
     # Pass rate row
     row = ["Pass Rate %"]
     for i, rate in enumerate(pass_rates):
@@ -968,7 +1210,6 @@ def assess_all(output_dir: Path, force: bool) -> None:
         else:
             row.append(f"{rate:.1f}%")
     table.add_row(*row)
-
     # Average score row
     row = ["Avg Score %"]
     for i, score in enumerate(avg_scores):
@@ -978,35 +1219,27 @@ def assess_all(output_dir: Path, force: bool) -> None:
         else:
             row.append(f"{score:.1f}%")
     table.add_row(*row)
-
     # Individual test scores
     first_assessment = assessments[checkpoint_nums[0]]
     test_names = [r["test_name"] for r in first_assessment["results"]]
-
     for test_idx, test_name in enumerate(test_names):
         row = [test_name]
         prev_score = None
-
         for num in checkpoint_nums:
             score = assessments[num]["results"][test_idx]["score"] * 100
             passed = assessments[num]["results"][test_idx]["passed"]
             symbol = "[green]✓[/green]" if passed else "[red]✗[/red]"
-
             if prev_score is not None and len(checkpoint_nums) > 3:
                 change = format_metric_change(score, prev_score)
                 row.append(f"{score:.1f}{symbol} {change}")
             else:
                 row.append(f"{score:.1f}{symbol}")
             prev_score = score
-
         table.add_row(*row)
-
     console.print()
     console.print(table)
-
     # Find best performers
     console.print("\n[bold cyan]Best Performers:[/bold cyan]")
-
     best_avg = max(
         checkpoint_nums, key=lambda n: assessments[n]["summary"]["average_score"]
     )
@@ -1014,7 +1247,6 @@ def assess_all(output_dir: Path, force: bool) -> None:
     console.print(
         f"  Best Average Score: [green]Checkpoint-{best_avg}[/green] ({best_avg_score:.1f}%)"
     )
-
     best_pass = max(
         checkpoint_nums, key=lambda n: assessments[n]["summary"]["pass_rate"]
     )
@@ -1022,7 +1254,6 @@ def assess_all(output_dir: Path, force: bool) -> None:
     console.print(
         f"  Best Pass Rate: [green]Checkpoint-{best_pass}[/green] ({best_pass_rate:.1f}%)"
     )
-
     # Check for plateau
     if len(checkpoint_nums) >= 3:
         last_three = checkpoint_nums[-3:]
@@ -1032,21 +1263,17 @@ def assess_all(output_dir: Path, force: bool) -> None:
             console.print(
                 f"  Last 3 checkpoints vary by <0.5%: {scores[0]:.1f}% - {scores[-1]:.1f}%"
             )
-
     # Visual chart for average score
     console.print("\n[bold cyan]Average Score Progression:[/bold cyan]")
     max_score = max(avg_scores)
-
     for i, (num, score) in enumerate(zip(checkpoint_nums, avg_scores, strict=False)):
         bar_length = int(score * 2)
         bar = "█" * bar_length
-
         marker = ""
         if score == max_score:
             marker = " [yellow]⭐ PEAK[/yellow]"
         elif i == len(checkpoint_nums) - 1:
             marker = " [cyan]← Current[/cyan]"
-
         console.print(f"  {num:5}: {bar:<40} {score:5.1f}%{marker}")
 
 

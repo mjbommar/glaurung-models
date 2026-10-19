@@ -13,7 +13,11 @@ from binary_embedding.models import (
     create_model,
 )
 from binary_embedding.tokenizer import BinaryTokenizer, load_tokenizer
-from binary_embedding.training import Trainer, TrainerConfig
+from binary_embedding.training import (
+    ContrastiveTrainer,
+    MLMTrainer,
+    TrainerConfig,
+)
 
 __all__ = [
     "BinaryTokenizer",
@@ -23,6 +27,7 @@ __all__ = [
     "BinaryEmbeddingConfig",
     "create_model",
     "ModelSize",
-    "Trainer",
+    "MLMTrainer",
+    "ContrastiveTrainer",
     "TrainerConfig",
 ]

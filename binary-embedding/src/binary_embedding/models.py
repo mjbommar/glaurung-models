@@ -18,9 +18,16 @@ from transformers import (
 
 
 class ModelSize(Enum):
-    """Predefined model sizes."""
+    """Predefined model sizes.
 
+    All sizes maintain 64 dims/layer ratio for stable gradient flow.
+    Scaling: NANO (8.8M) → MICRO (14M) → SMALL (20M) → MEDIUM (40M) → BASE (78M) → LARGE (160M)
+    """
+
+    NANO = "nano"
+    MICRO = "micro"
     SMALL = "small"
+    MEDIUM = "medium"
     BASE = "base"
     LARGE = "large"
 
@@ -53,7 +60,7 @@ class BinaryEmbeddingConfig:
     adam_beta1: float = 0.9
     adam_beta2: float = 0.999
     adam_epsilon: float = 1e-8
-    max_grad_norm: float = 1.0
+    max_grad_norm: float = 2.0
     warmup_steps: int = 1000
     mlm_probability: float = 0.20
 
@@ -98,33 +105,73 @@ class BinaryEmbeddingConfig:
 def get_model_config(size: ModelSize) -> BinaryEmbeddingConfig:
     """Get predefined model configuration.
 
+    All configurations maintain 64 dims/layer (hidden_size / num_layers) to prevent
+    rank collapse and ensure stable gradient flow. This is based on empirical evidence
+    from training experiments showing that 128/4=32 dims/layer caused severe rank
+    collapse in deeper layers.
+
+    Head dimension is consistently 32 across all sizes (hidden_size / num_heads).
+    FFN intermediate size is 4× hidden_size based on proven performance.
+
     Args:
         size: Model size enum.
 
     Returns:
         Model configuration.
     """
-    if size == ModelSize.SMALL:
+    if size == ModelSize.NANO:
+        # ~8.8M params (96% embeddings, 4% encoder)
+        # Smallest safe configuration: 128/2 = 64 dims/layer
+        return BinaryEmbeddingConfig(
+            hidden_size=128,
+            num_hidden_layers=2,
+            num_attention_heads=4,  # 32 dims/head
+            intermediate_size=512,  # 4× hidden
+        )
+    elif size == ModelSize.MICRO:
+        # ~14M params (91% embeddings, 9% encoder)
+        # Quick experiments: 192/3 = 64 dims/layer
+        return BinaryEmbeddingConfig(
+            hidden_size=192,
+            num_hidden_layers=3,
+            num_attention_heads=6,  # 32 dims/head
+            intermediate_size=768,  # 4× hidden
+        )
+    elif size == ModelSize.SMALL:
+        # ~20M params (85% embeddings, 15% encoder)
+        # Main experimentation: 256/4 = 64 dims/layer
         return BinaryEmbeddingConfig(
             hidden_size=256,
+            num_hidden_layers=4,
+            num_attention_heads=8,  # 32 dims/head
+            intermediate_size=1024,  # 4× hidden
+        )
+    elif size == ModelSize.MEDIUM:
+        # ~40M params (63% embeddings, 37% encoder)
+        # Production deployments: 384/6 = 64 dims/layer
+        return BinaryEmbeddingConfig(
+            hidden_size=384,
             num_hidden_layers=6,
-            num_attention_heads=8,
-            intermediate_size=1024,
+            num_attention_heads=12,  # 32 dims/head
+            intermediate_size=1536,  # 4× hidden
         )
     elif size == ModelSize.BASE:
+        # ~78M params (43% embeddings, 57% encoder)
+        # High-quality embeddings: 512/8 = 64 dims/layer
+        return BinaryEmbeddingConfig(
+            hidden_size=512,
+            num_hidden_layers=8,
+            num_attention_heads=16,  # 32 dims/head
+            intermediate_size=2048,  # 4× hidden
+        )
+    else:  # LARGE
+        # ~160M params (32% embeddings, 68% encoder)
+        # Best quality (BERT-base equivalent): 768/12 = 64 dims/layer
         return BinaryEmbeddingConfig(
             hidden_size=768,
             num_hidden_layers=12,
-            num_attention_heads=12,
-            intermediate_size=3072,
-        )
-    else:  # LARGE
-        return BinaryEmbeddingConfig(
-            hidden_size=1024,
-            num_hidden_layers=24,
-            num_attention_heads=16,
-            intermediate_size=4096,
-            mlm_probability=0.40,  # Higher masking for large models
+            num_attention_heads=12,  # 64 dims/head
+            intermediate_size=3072,  # 4× hidden
         )
 
 

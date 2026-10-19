@@ -1,62 +1,39 @@
-#!/bin/bash
+#!/usr/bin/bash
 
-# Generate timestamp for run name
 TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
-
-# Default values from code (not specified here):
-# - weight_decay: 0.0001 (reduced from 0.01 for better memorization)
-# - hidden_dropout_prob: 0.01 (reduced from 0.1)
-# - attention_probs_dropout_prob: 0.01 (reduced from 0.1)
-# - mlm_probability: 0.20 (kept at default)
-# - tokenizer: binary-tokenizer-005 (65536 vocab size)
-# 
-
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export PYTHONPATH=src
+export CUDA_VISIBLE_DEVICES=0
 
-#        
-#        --contrastive \
-#       --pooling mean \
-#       --dup-prob 0.5 \
-#       --contrastive-temp 0.07 \
-#       --mlm-weight 1.0 \
-#       --view-weight 0.25 \
-#       --samefile-weight 0.25 \
-#       --contrastive-ramp-steps 5000 \
-#       --pair-cache-size 4096 \
-#       --prefetch-factor 4 \
-#       --num-workers 4 \
-
-#--data-dir /nas4/data/glaurung-data/binaries/ \
-    
-uv run python -m binary_embedding.cli train \
-       --model-size small \
-       --model-type roberta \
-       --data-dir /nas4/data/glaurung-data/binaries/ \
-       --max-steps 100000 \
-       --warmup-ratio 0.1 \
-       --save-steps 1000 \
-       --gradient-checkpointing \
-       --learning-rate 0.001 \
-       --batch-size 32 \
-       --gradient-accumulation-steps 1 \
-       --use-adaptive-grad-clip \
-       --grad-clip-percentile 95.0 \
-       --grad-clip-history-size 100 \
-       --grad-clip-initial-threshold 10.0 \
-       --save-total-limit 10 \
-       --run-assessment \
-       --assessment-steps 100 \
-       --streaming \
-       --enable-entropy-filtering \
-       --entropy-bins "0,1.0,3.0,6.0,7.5,8.0" \
-       --entropy-weights "1.5,1.5,1.2,0.8,0.5" \
-       --use-wandb \
-       --wandb-project "glaurung-binary-002" \
-       --wandb-run-name "run_${TIMESTAMP}" \
-       --wandb-tags "base" \
-       --wandb-tags "roberta" \
-       --wandb-tags "entropy_filter" \
-       --wandb-tags "low_dropout_0.01" \
-       --wandb-tags "low_wd_0.0001" \
-       --wandb-notes "Binary embedding with reduced regularization (dropout=0.01, wd=0.0001) and adjusted entropy weights for better file header memorization"
+# Run 3: Optimal NANO training based on empirical results
+# Run 1 (cosine, 50k): Peaked at 26k (24.72%), LR decayed too fast
+# Run 2 (trapezoid, 80k): Peaked at 37k (29.06%), then overfitted
+# Run 3: 50k steps captures peak window without overfitting
+uv run python -m binary_embedding.cli mlm-pretrain \
+   --model-size nano \
+   --model-type roberta \
+   --data-dir /nas4/data/glaurung-data/binaries-small/ \
+   --streaming \
+   --tokenizer-path ./tokenizer.json \
+   --max-steps 50000 \
+   --warmup-steps 7500 \
+   --scheduler-type trapezoidal \
+   --learning-rate 0.0001 \
+   --weight-decay 0.00005 \
+   --max-length 512 \
+   --mixed-precision \
+   --gradient-accumulation-steps 1 \
+   --max-grad-norm 2.0 \
+   --batch-size 32 \
+   --run-assessment \
+   --assessment-steps 1000 \
+   --save-steps 1000 \
+   --use-wandb \
+   --wandb-project "glaurung-binary-nano" \
+   --wandb-run-name "nano_optimal_${TIMESTAMP}" \
+   --wandb-tags "nano" \
+   --wandb-tags "roberta" \
+   --wandb-tags "mlm" \
+   --wandb-tags "trapezoidal" \
+   --wandb-tags "optimal" \
+   --wandb-notes "NANO optimal: 50k steps, trap schedule, stops before overfitting"

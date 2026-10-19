@@ -2,10 +2,16 @@
 
 from __future__ import annotations
 
+import atexit
 import json
+import math
+import time
+from abc import ABC, abstractmethod
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
+from datetime import datetime
 from pathlib import Path
+from threading import Lock
 from typing import Any
 
 import numpy as np
@@ -62,6 +68,44 @@ console = Console()
 
 
 @dataclass
+class TrainingMetricSpec:
+    key: str
+    field: str
+    label: str
+    wandb_name: str
+
+
+@dataclass
+class StepResult:
+    loss: torch.Tensor
+    metrics: dict[str, torch.Tensor]
+    extras: dict[str, float] | None = None
+
+
+class JSONLLogger:
+    """Simple JSONL writer for detailed local diagnostics."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = Path(path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._lock = Lock()
+        # Line-buffered text file to keep entries durable without large flushes.
+        self._file = open(self.path, "a", buffering=1, encoding="utf-8")
+        atexit.register(self.close)
+
+    def log(self, record: dict[str, Any]) -> None:
+        line = json.dumps(record)
+        with self._lock:
+            self._file.write(line + "\n")
+            self._file.flush()
+
+    def close(self) -> None:
+        with self._lock:
+            if not self._file.closed:
+                self._file.close()
+
+
+@dataclass
 class TrainerConfig:
     """Configuration for training with optional advanced features."""
 
@@ -71,7 +115,7 @@ class TrainerConfig:
     adam_beta1: float = 0.9
     adam_beta2: float = 0.999
     adam_epsilon: float = 1e-8
-    max_grad_norm: float = 1.0
+    max_grad_norm: float = 2.0
 
     # Adaptive gradient clipping
     use_adaptive_grad_clip: bool = False
@@ -102,6 +146,7 @@ class TrainerConfig:
     restart_interval: int = 10000  # For cosine_with_restarts
     restart_mult: int = 2
     polynomial_power: float = 1.0  # For polynomial scheduler
+    plateau_ratio: float = 0.6  # For trapezoidal scheduler (fraction of steps at peak LR)
 
     # Early stopping
     use_early_stopping: bool = False
@@ -112,14 +157,14 @@ class TrainerConfig:
     # Checkpointing
     output_dir: str = "./output"
     save_steps: int = 1000
-    save_total_limit: int | None = None
+    save_total_limit: int | None = 5
     save_best_only: bool = False
 
     # Evaluation
     eval_steps: int = 500
     logging_steps: int = 10
-    assessment_steps: int = 10000  # Run full assessment every N steps
-    run_assessment: bool = False  # Whether to run periodic assessments
+    assessment_steps: int = 1000  # Run full assessment every N steps
+    run_assessment: bool = True  # Whether to run periodic assessments
 
     # WandB configuration
     use_wandb: bool = True
@@ -131,6 +176,11 @@ class TrainerConfig:
     # Performance
     mixed_precision: bool = True
     gradient_checkpointing: bool = False
+
+    # Local logging
+    enable_jsonl_logging: bool = True
+    jsonl_log_path: str | None = None
+    jsonl_log_frequency: int = 1
 
     # Contrastive training options
     contrastive_enabled: bool = False  # Enable dual-loss training
@@ -153,10 +203,27 @@ class TrainerConfig:
         """Create config optimized for model size.
 
         Args:
-            model_size: "small", "base", or "large".
+            model_size: "nano", "micro", "small", "base", or "large".
             **kwargs: Override any default settings.
         """
-        if model_size == "small":
+        if model_size == "nano":
+            config = cls(
+                learning_rate=1e-4,  # Higher LR for tiny models
+                batch_size=32,
+                gradient_accumulation_steps=1,
+                scheduler_type="trapezoidal",  # Better than cosine for small models
+                warmup_ratio=0.15,  # 15% warmup
+                weight_decay=5e-5,  # Lower regularization for tiny models
+            )
+        elif model_size == "micro":
+            config = cls(
+                learning_rate=7e-5,  # Higher LR for small models
+                batch_size=24,
+                gradient_accumulation_steps=2,
+                scheduler_type="cosine",
+                warmup_ratio=0.12,
+            )
+        elif model_size == "small":
             config = cls(
                 learning_rate=5e-5,  # Increased for better learning
                 batch_size=16,
@@ -190,8 +257,8 @@ class TrainerConfig:
         return config
 
 
-class Trainer:
-    """Trainer for binary embedding models with optional advanced features."""
+class BaseTrainer(ABC):
+    """Shared trainer base class for MLM and contrastive stages."""
 
     def __init__(
         self,
@@ -199,6 +266,8 @@ class Trainer:
         tokenizer: BinaryTokenizer,
         train_dataloader: DataLoader,
         config: TrainerConfig,
+        stage: str,
+        metric_specs: tuple[TrainingMetricSpec, ...],
         model_config: BinaryEmbeddingConfig | None = None,
         val_dataloader: DataLoader | None = None,
         resume_from_checkpoint: Path | None = None,
@@ -220,6 +289,15 @@ class Trainer:
         self.val_dataloader = val_dataloader
         self.config = config
         self.model_config = model_config
+        self.stage = stage
+        self.metric_specs = metric_specs
+        self.metric_map = {spec.key: spec for spec in metric_specs}
+        self.metric_keys = tuple(spec.key for spec in metric_specs)
+
+        # Update config to reflect stage for downstream logging/checkpointing
+        self.config.contrastive_enabled = stage == "contrastive"
+        if self.config.jsonl_log_frequency < 1:
+            self.config.jsonl_log_frequency = 1
 
         # Setup output directory
         self.output_dir = Path(config.output_dir)
@@ -271,7 +349,10 @@ class Trainer:
         self.is_streaming = False
         try:
             dl_len = len(train_dataloader)
-            steps_per_epoch = max(1, dl_len // config.gradient_accumulation_steps)
+            steps_per_epoch = max(
+                1,
+                math.ceil(dl_len / config.gradient_accumulation_steps),
+            )
         except TypeError:
             self.is_streaming = True
             steps_per_epoch = None
@@ -292,6 +373,21 @@ class Trainer:
                 )
             self.total_steps = steps_per_epoch * config.num_epochs
             self.steps_per_epoch = steps_per_epoch
+
+        self.jsonl_logger: JSONLLogger | None = None
+        self._jsonl_log_path: Path | None = None
+        self._last_jsonl_log_time: float | None = None
+
+        if self.config.enable_jsonl_logging and self.accelerator.is_main_process:
+            log_path = (
+                Path(self.config.jsonl_log_path)
+                if self.config.jsonl_log_path
+                else self.output_dir / f"{self.stage}_training_log.jsonl"
+            )
+            if not log_path.is_absolute():
+                log_path = Path.cwd() / log_path
+            self.jsonl_logger = JSONLLogger(log_path)
+            self._jsonl_log_path = log_path
 
         # Setup optimizer
         self.optimizer = self._setup_optimizer()
@@ -361,6 +457,7 @@ class Trainer:
         self.global_step = 0
         self.best_val_loss = float("inf")
         self.training_history: list[dict[str, Any]] = []
+        self.assessment_history: list[dict[str, Any]] = []
 
         # Gradient norm tracking for adaptive clipping
         self.grad_norm_history: deque[float] = deque(
@@ -371,11 +468,31 @@ class Trainer:
         # Initialize WandB if enabled
         self.wandb_run = None
         if WANDB_AVAILABLE and config.use_wandb and self.accelerator.is_main_process:
-            self._init_wandb()
+            init_wandb = getattr(self, "_init_wandb", None)
+            if callable(init_wandb):
+                init_wandb()
 
         # Resume from checkpoint if provided
         if resume_from_checkpoint:
             self.load_checkpoint(resume_from_checkpoint)
+
+        if self.jsonl_logger and self.accelerator.is_main_process:
+            config_snapshot = asdict(self.config)
+            config_snapshot["output_dir"] = str(self.output_dir)
+            event_payload = {
+                "stage": self.stage,
+                "total_steps": int(self.total_steps),
+                "steps_per_epoch": int(self.steps_per_epoch),
+                "is_streaming": bool(self.is_streaming),
+                "resume_from_checkpoint": str(resume_from_checkpoint)
+                if resume_from_checkpoint
+                else None,
+                "jsonl_log_path": str(self._jsonl_log_path)
+                if self._jsonl_log_path
+                else None,
+                "config": config_snapshot,
+            }
+            self._log_jsonl_event("session_start", event_payload, include_step=False)
 
     def _setup_optimizer(self) -> AdamW:
         """Setup AdamW optimizer with weight decay.
@@ -433,6 +550,7 @@ class Trainer:
                     restart_interval=self.config.restart_interval,
                     restart_mult=self.config.restart_mult,
                     power=self.config.polynomial_power,
+                    plateau_ratio=self.config.plateau_ratio,
                 )
                 return create_scheduler(
                     self.optimizer,
@@ -449,9 +567,15 @@ class Trainer:
             num_training_steps=self.total_steps,
         )
 
+    @abstractmethod
+    def _forward_step(self, batch: Any) -> StepResult:
+        """Compute the loss and metrics for a single optimizer step."""
+        raise NotImplementedError
+
     def train(self) -> None:
         """Run the training loop."""
         self.model.train()
+        self._last_jsonl_log_time = None
         console.print(
             f"[bold green]Starting training on {self.accelerator.device}[/bold green]"
         )
@@ -460,37 +584,44 @@ class Trainer:
             f"[cyan]Effective batch size: {self.config.batch_size * self.config.gradient_accumulation_steps}[/cyan]"
         )
 
+        if self.jsonl_logger and self.accelerator.is_main_process:
+            self._log_jsonl_event(
+                "training_start",
+                {
+                    "effective_batch_size": self.config.batch_size
+                    * self.config.gradient_accumulation_steps,
+                    "gradient_accumulation_steps": self.config.gradient_accumulation_steps,
+                    "total_steps": int(self.total_steps),
+                },
+                include_step=False,
+            )
+
         should_stop = False
 
-        # Calculate number of epochs needed
-        # Note: steps_per_epoch should match the calculation used for total_steps
         try:
             dataloader_len = len(self.train_dataloader)
             steps_per_epoch = max(
-                1, dataloader_len // self.config.gradient_accumulation_steps
+                1,
+                math.ceil(dataloader_len / self.config.gradient_accumulation_steps),
             )
             console.print(f"[dim]Dataloader length: {dataloader_len} batches[/dim]")
         except TypeError:
-            # Streaming: use precomputed virtual steps_per_epoch for progress display
             dataloader_len = None
             steps_per_epoch = self.steps_per_epoch
             console.print("[dim]Dataloader: streaming (no fixed length)[/dim]")
+
         console.print(
             f"[dim]Gradient accumulation steps: {self.config.gradient_accumulation_steps}[/dim]"
         )
 
-        # If num_epochs was specified in config, use that; otherwise calculate from total_steps
         if self.config.max_steps:
-            num_epochs = (
-                (self.total_steps + steps_per_epoch - 1) // steps_per_epoch
-            )  # Ceiling division (works for streaming via virtual steps)
+            num_epochs = max(1, math.ceil(self.total_steps / steps_per_epoch))
         else:
             num_epochs = self.config.num_epochs
 
         console.print(f"[cyan]Steps per epoch: {steps_per_epoch}[/cyan]")
         console.print(f"[cyan]Number of epochs: {num_epochs}[/cyan]")
 
-        # Start from the correct epoch if resuming
         start_epoch = self.starting_epoch + 1 if hasattr(self, "starting_epoch") else 1
         if start_epoch > 1:
             console.print(f"[yellow]Resuming from epoch {start_epoch}[/yellow]")
@@ -499,74 +630,71 @@ class Trainer:
             if should_stop or self.global_step >= self.total_steps:
                 break
 
-            # Initialize epoch metrics
-            # When resuming mid-epoch, start with last known loss to avoid 0.0000 display
-            if (
-                epoch == start_epoch
-                and self.global_step > 0
-                and len(self.training_history) > 0
-            ):
-                # Get the last logged loss
-                last_entry = self.training_history[-1]
-                epoch_loss = last_entry.get("loss", 0.0)
-                epoch_steps = 1  # Avoid division by zero
-            else:
-                epoch_loss = 0.0
-                epoch_steps = 0
-            # Component losses (running sums for averaged display)
-            epoch_mlm_loss = 0.0
-            epoch_view_ctr_loss = 0.0
-            epoch_samefile_ctr_loss = 0.0
-
-            # Calculate how many steps to show for this epoch
             remaining_steps = self.total_steps - self.global_step
             steps_this_epoch = min(steps_per_epoch, remaining_steps)
+            if steps_this_epoch <= 0:
+                break
+
+            if epoch == start_epoch and self.global_step > 0 and self.training_history:
+                last_entry = self.training_history[-1]
+                epoch_loss_sum = last_entry.get("loss", 0.0)
+                epoch_steps = 1
+                metric_sums = {
+                    spec.key: last_entry.get(spec.key, 0.0)
+                    for spec in self.metric_specs
+                }
+            else:
+                epoch_loss_sum = 0.0
+                epoch_steps = 0
+                metric_sums = {spec.key: 0.0 for spec in self.metric_specs}
+
+                metric_columns = [
+                    TextColumn(
+                        f"• {spec.label}: " + f"{{task.fields[{spec.field}]:.4f}}"
+                    )
+                    for spec in self.metric_specs
+                ]
 
             with Progress(
                 TextColumn("[bold blue]Epoch {task.fields[epoch]}"),
                 BarColumn(),
                 MofNCompleteColumn(),
                 TextColumn("• Loss: {task.fields[loss]:.4f}"),
-                TextColumn("• MLM: {task.fields[mlm]:.4f}"),
-                TextColumn("• VCtr: {task.fields[vctr]:.4f}"),
-                TextColumn("• SFCtr: {task.fields[sfctr]:.4f}"),
+                *metric_columns,
                 TextColumn("• LR: {task.fields[lr]:.2e}"),
                 TimeElapsedColumn(),
                 TimeRemainingColumn(),
                 console=console,
                 disable=not self.accelerator.is_local_main_process,
             ) as progress:
-                # Get current learning rate (especially important when resuming)
                 current_lr = (
                     self.scheduler.get_last_lr()[0]
                     if hasattr(self.scheduler, "get_last_lr")
                     else self.config.learning_rate
                 )
 
-                # Progress bar tracks STEPS, not batches
-                # Initialize with current loss if resuming
-                initial_loss = (
-                    float(epoch_loss / epoch_steps) if epoch_steps > 0 else 0.0
-                )
+                task_fields = {
+                    "epoch": epoch,
+                    "loss": float(epoch_loss_sum / epoch_steps) if epoch_steps else 0.0,
+                    "lr": float(current_lr),
+                }
+                for spec in self.metric_specs:
+                    avg_val = (
+                        metric_sums[spec.key] / epoch_steps if epoch_steps else 0.0
+                    )
+                    task_fields[spec.field] = float(avg_val)
+
                 task = progress.add_task(
                     "Training",
                     total=steps_this_epoch,
-                    epoch=epoch,
-                    loss=initial_loss,
-                    mlm=0.0,
-                    vctr=0.0,
-                    sfctr=0.0,
-                    lr=current_lr,
+                    **task_fields,
                 )
 
-                # Calculate batches to skip if resuming mid-epoch
                 batches_to_skip = 0
                 steps_to_skip = 0
-                if epoch == start_epoch and self.global_step > 0:
-                    # Check if we're actually mid-epoch (not at an epoch boundary)
+                if epoch == start_epoch and self.global_step > 0 and steps_per_epoch:
                     steps_in_epoch = self.global_step % steps_per_epoch
                     if steps_in_epoch > 0:
-                        # We're resuming mid-epoch, need to skip already processed batches
                         batches_to_skip = (
                             steps_in_epoch * self.config.gradient_accumulation_steps
                         )
@@ -577,198 +705,36 @@ class Trainer:
                         console.print(
                             f"[dim]Skipping {batches_to_skip} batches already processed[/dim]"
                         )
-                        # Update progress bar to show we're starting from the middle
                         progress.update(task, completed=steps_to_skip)
 
                 for batch_idx, batch in enumerate(self.train_dataloader):
-                    # Skip batches if resuming mid-epoch
                     if batch_idx < batches_to_skip:
                         continue
 
                     if self.global_step >= self.total_steps:
                         break
 
+                    next_step = self.global_step + 1
+                    jsonl_candidate = (
+                        self.jsonl_logger is not None
+                        and self.accelerator.is_main_process
+                        and (next_step % self.config.jsonl_log_frequency == 0)
+                    )
+                    batch_stats: dict[str, Any] | None = None
+                    grad_stats: dict[str, Any] | None = None
+                    log_this_step = False
+
                     with self.accelerator.accumulate(self.model):
-                        # Defaults for component logging (torch scalars)
-                        log_mlm_t = torch.tensor(0.0, device=self.accelerator.device)
-                        log_view_t = torch.tensor(0.0, device=self.accelerator.device)
-                        log_sf_t = torch.tensor(0.0, device=self.accelerator.device)
-                        # Determine if batch contains contrastive pairs
-                        is_pair_batch = (
-                            self.config.contrastive_enabled
-                            and isinstance(batch, dict)
-                            and "pair_types" in batch
-                            and batch["input_ids"].dim() == 3
-                        )
+                        step_result = self._forward_step(batch)
+                        loss = step_result.loss
 
-                        if is_pair_batch:
-                            # Flatten [B, 2, L] -> [2B, L]
-                            bsz, views, seqlen = batch["input_ids"].shape
-                            input_ids = batch["input_ids"].view(bsz * views, seqlen)
-                            attention_mask = batch["attention_mask"].view(
-                                bsz * views, seqlen
-                            )
-                            labels = batch["labels"].view(bsz * views, seqlen)
-
-                            # Memory-safe forward: compute last_hidden + MLM loss without returning logits
-                            # Use backbone (roberta/bert) directly to avoid Accelerate upcasting huge logits
-                            with self.accelerator.autocast():
-                                # Identify backbone and MLM head
-                                if hasattr(self.model, "roberta"):
-                                    backbone = self.model.roberta
-                                elif hasattr(self.model, "bert"):
-                                    backbone = self.model.bert
-                                else:
-                                    backbone = None
-
-                                if hasattr(self.model, "lm_head"):
-                                    mlm_head = self.model.lm_head
-                                elif hasattr(self.model, "cls"):
-                                    mlm_head = self.model.cls
-                                else:
-                                    mlm_head = None
-
-                                if backbone is not None and mlm_head is not None:
-                                    base_out = backbone(
-                                        input_ids=input_ids,
-                                        attention_mask=attention_mask,
-                                        return_dict=True,
-                                    )
-                                    last_hidden = base_out.last_hidden_state
-                                    prediction_scores = mlm_head(last_hidden)
-                                    vocab_size = prediction_scores.size(-1)
-                                    mlm_loss = F.cross_entropy(
-                                        prediction_scores.view(-1, vocab_size),
-                                        labels.view(-1),
-                                        ignore_index=-100,
-                                    )
-                                else:
-                                    # Fallback to standard forward if unexpected model type
-                                    outputs = self.model(
-                                        input_ids=input_ids,
-                                        attention_mask=attention_mask,
-                                        labels=labels,
-                                        return_dict=True,
-                                    )
-                                    mlm_loss = outputs.loss
-                                    if hasattr(outputs, "last_hidden_state"):
-                                        last_hidden = outputs.last_hidden_state
-                                    else:
-                                        outputs_h = self.model(
-                                            input_ids=input_ids,
-                                            attention_mask=attention_mask,
-                                            return_dict=True,
-                                            output_hidden_states=True,
-                                        )
-                                        last_hidden = outputs_h.hidden_states[-1]
-                            emb = pool_embeddings(
-                                last_hidden,
-                                attention_mask,
-                                method=self.config.pooling,
-                            )
-                            emb = emb.view(bsz, views, -1)
-
-                            # Contrastive subsets
-                            pair_types = batch["pair_types"].to(emb.device)
-                            dup_a, dup_b, sf_a, sf_b = split_by_pair_type(
-                                emb, pair_types
-                            )
-
-                            view_loss = (
-                                info_nce_pairwise(
-                                    dup_a, dup_b, self.config.contrastive_temperature
-                                )
-                                if dup_a.size(0) > 0
-                                else mlm_loss.new_tensor(0.0)
-                            )
-                            same_file_loss = (
-                                info_nce_pairwise(
-                                    sf_a, sf_b, self.config.contrastive_temperature
-                                )
-                                if sf_a.size(0) > 0
-                                else mlm_loss.new_tensor(0.0)
-                            )
-
-                            # Linear ramp for contrastive weights
-                            if (
-                                self.config.contrastive_ramp_steps
-                                and self.config.contrastive_ramp_steps > 0
-                            ):
-                                ramp = min(
-                                    1.0,
-                                    self.global_step
-                                    / float(self.config.contrastive_ramp_steps),
-                                )
-                            else:
-                                ramp = 1.0
-
-                            mlm_w = self.config.mlm_weight
-                            view_w = self.config.view_contrastive_weight * ramp
-                            sf_w = self.config.same_file_contrastive_weight * ramp
-
-                            total_loss = (
-                                mlm_w * mlm_loss
-                                + view_w * view_loss
-                                + sf_w * same_file_loss
-                            )
-                            loss = total_loss
-                            # Record components for display
-                            log_mlm_t = mlm_loss.detach().float()
-                            log_view_t = view_loss.detach().float()
-                            log_sf_t = same_file_loss.detach().float()
-                        else:
-                            # Standard MLM batch (no contrastive). Compute loss without returning logits.
-                            in_ids = batch["input_ids"]
-                            attn = batch["attention_mask"]
-                            lbls = batch["labels"]
-
-                            with self.accelerator.autocast():
-                                if hasattr(self.model, "roberta"):
-                                    backbone = self.model.roberta
-                                elif hasattr(self.model, "bert"):
-                                    backbone = self.model.bert
-                                else:
-                                    backbone = None
-
-                                if hasattr(self.model, "lm_head"):
-                                    mlm_head = self.model.lm_head
-                                elif hasattr(self.model, "cls"):
-                                    mlm_head = self.model.cls
-                                else:
-                                    mlm_head = None
-
-                                if backbone is not None and mlm_head is not None:
-                                    base_out = backbone(
-                                        input_ids=in_ids,
-                                        attention_mask=attn,
-                                        return_dict=True,
-                                    )
-                                    last_hidden = base_out.last_hidden_state
-                                    prediction_scores = mlm_head(last_hidden)
-                                    vocab_size = prediction_scores.size(-1)
-                                    loss = F.cross_entropy(
-                                        prediction_scores.view(-1, vocab_size),
-                                        lbls.view(-1),
-                                        ignore_index=-100,
-                                    )
-                                else:
-                                    outputs = self.model(
-                                        input_ids=in_ids,
-                                        attention_mask=attn,
-                                        labels=lbls,
-                                        return_dict=True,
-                                    )
-                                    loss = outputs.loss
-                            log_mlm_t = loss.detach().float()
-
-                        # Backward pass
                         self.accelerator.backward(loss)
 
-                        # Only do optimizer step when gradients are synchronized
+                        grad_norm = 0.0
+                        adaptive_clip_threshold = self.config.max_grad_norm
+
                         if self.accelerator.sync_gradients:
-                            # Gradient clipping
                             if self.config.use_adaptive_grad_clip:
-                                # Calculate current gradient norm
                                 total_norm = 0.0
                                 for p in self.model.parameters():
                                     if p.grad is not None:
@@ -776,195 +742,177 @@ class Trainer:
                                         total_norm += param_norm.item() ** 2
                                 current_grad_norm = total_norm**0.5
 
-                                # Determine clipping threshold
                                 if (
                                     self.global_step
                                     < self.config.grad_clip_history_size
                                 ):
-                                    # Use initial threshold for first N steps
                                     clip_threshold = (
                                         self.config.grad_clip_initial_threshold
                                     )
                                 else:
-                                    # Use percentile of recent gradient norms
-                                    if len(self.grad_norm_history) > 0:
+                                    if self.grad_norm_history:
                                         clip_threshold = np.percentile(
                                             list(self.grad_norm_history),
                                             self.config.grad_clip_percentile,
                                         )
-                                        # Ensure we don't go below a minimum threshold
-                                        clip_threshold = max(clip_threshold, 1.0)
                                     else:
                                         clip_threshold = (
                                             self.config.grad_clip_initial_threshold
                                         )
 
-                                # Apply gradient clipping with adaptive threshold
-                                grad_norm = self.accelerator.clip_grad_norm_(
+                                clip_threshold = max(clip_threshold, 1.0)
+
+                                # Enforce the configured maximum even when adaptive clipping is enabled
+                                if self.config.max_grad_norm > 0:
+                                    clip_threshold = min(
+                                        clip_threshold,
+                                        self.config.max_grad_norm,
+                                    )
+
+                                grad_norm_tensor = self.accelerator.clip_grad_norm_(
                                     self.model.parameters(),
                                     clip_threshold,
                                 )
-
-                                # Track gradient norm for future percentile calculation
+                                grad_norm = float(grad_norm_tensor)
                                 self.grad_norm_history.append(current_grad_norm)
-
-                                # Store threshold for logging
                                 adaptive_clip_threshold = clip_threshold
                             else:
-                                # Standard gradient clipping
-                                grad_norm = self.accelerator.clip_grad_norm_(
+                                grad_norm_tensor = self.accelerator.clip_grad_norm_(
                                     self.model.parameters(),
                                     self.config.max_grad_norm,
                                 )
+                                grad_norm = float(grad_norm_tensor)
                                 adaptive_clip_threshold = self.config.max_grad_norm
 
-                            # Optimizer step
+                            if jsonl_candidate:
+                                batch_stats = self._collect_batch_stats(batch)
+                                grad_stats = self._collect_gradient_stats()
+                                log_this_step = True
+
                             self.optimizer.step()
                             self.scheduler.step()
-                            # Use set_to_none to reduce VRAM and improve perf
                             self.optimizer.zero_grad(set_to_none=True)
-                        else:
-                            grad_norm = 0.0
-                            adaptive_clip_threshold = 0.0
 
-                    # Only update metrics and progress on actual optimizer steps
-                    # (not on every batch during gradient accumulation)
-                    if self.accelerator.sync_gradients:
-                        # This is an actual optimizer step
-                        epoch_loss += loss.detach().float()
+                        if not self.accelerator.sync_gradients:
+                            continue
+
+                        step_loss = float(loss.detach().float().cpu())
+                        epoch_loss_sum += step_loss
                         epoch_steps += 1
                         self.global_step += 1
 
-                        # Update progress bar (once per step, not per batch)
-                        current_loss = epoch_loss / epoch_steps
-                        # Update component running averages
-                        epoch_mlm_loss += log_mlm_t
-                        epoch_view_ctr_loss += log_view_t
-                        epoch_samefile_ctr_loss += log_sf_t
-                        current_mlm = epoch_mlm_loss / epoch_steps
-                        current_vctr = epoch_view_ctr_loss / epoch_steps
-                        current_sfctr = epoch_samefile_ctr_loss / epoch_steps
-                        current_lr = self.scheduler.get_last_lr()[0]
-                        progress.update(
-                            task,
-                            advance=1,
-                            loss=float(current_loss),
-                            mlm=float(current_mlm),
-                            vctr=float(current_vctr),
-                            sfctr=float(current_sfctr),
-                            lr=current_lr,
+                        step_metrics: dict[str, float] = {}
+                        for spec in self.metric_specs:
+                            value = step_result.metrics.get(spec.key)
+                            numeric = (
+                                float(value.detach().float().cpu())
+                                if value is not None
+                                else 0.0
+                            )
+                            metric_sums[spec.key] += numeric
+                            step_metrics[spec.key] = numeric
+
+                        avg_loss = epoch_loss_sum / epoch_steps
+                        avg_metrics = {
+                            spec.key: metric_sums[spec.key] / epoch_steps
+                            for spec in self.metric_specs
+                        }
+
+                        current_lr = (
+                            self.scheduler.get_last_lr()[0]
+                            if hasattr(self.scheduler, "get_last_lr")
+                            else self.config.learning_rate
                         )
 
-                        # Log metrics (only after we have computed current_loss)
+                        update_fields = {
+                            "loss": float(avg_loss),
+                            "lr": float(current_lr),
+                        }
+                        for spec in self.metric_specs:
+                            update_fields[spec.field] = float(
+                                avg_metrics.get(spec.key, 0.0)
+                            )
+
+                        progress.update(task, advance=1, **update_fields)
+
+                        if log_this_step:
+                            extras_payload = (
+                                {k: float(v) for k, v in step_result.extras.items()}
+                                if step_result.extras
+                                else None
+                            )
+                            batch_payload = batch_stats if batch_stats else None
+                            grad_payload = grad_stats if grad_stats else None
+                            self._log_jsonl_step(
+                                epoch=epoch,
+                                epoch_step=epoch_steps,
+                                steps_this_epoch=steps_this_epoch,
+                                step_loss=step_loss,
+                                avg_loss=avg_loss,
+                                grad_norm=grad_norm,
+                                adaptive_clip_threshold=adaptive_clip_threshold,
+                                current_lr=current_lr,
+                                step_metrics=step_metrics,
+                                batch_stats=batch_payload,
+                                grad_stats=grad_payload,
+                                extras=extras_payload,
+                            )
+
                         if self.global_step % self.config.logging_steps == 0:
-                            log_dict = {
+                            log_entry = {
                                 "step": self.global_step,
                                 "epoch": epoch,
-                                "loss": float(current_loss),
+                                "loss": float(avg_loss),
                                 "grad_norm": float(grad_norm),
                                 "grad_clip_threshold": float(adaptive_clip_threshold),
                                 "learning_rate": float(current_lr),
                             }
-
-                            if self.accelerator.sync_gradients:
-                                log_dict["gradient_norm"] = float(grad_norm)
-
-                            self.training_history.append(log_dict)
-
-                            # Log to WandB
-                            if self.wandb_run and self.accelerator.is_main_process:
-                                wandb_log = {
-                                    "train/loss": float(current_loss),
-                                    "train/learning_rate": float(current_lr),
-                                    "train/epoch": epoch,
-                                    "train/global_step": self.global_step,
-                                }
-                                if self.accelerator.sync_gradients:
-                                    wandb_log["train/gradient_norm"] = float(grad_norm)
-
-                                # Add per-loss components if available
-                                # Defaults are zero when running pure-MLM batches
-                                try:
-                                    mlm_step = float(log_mlm_t)
-                                except Exception:
-                                    mlm_step = 0.0
-                                try:
-                                    view_step = float(log_view_t)
-                                except Exception:
-                                    view_step = 0.0
-                                try:
-                                    sf_step = float(log_sf_t)
-                                except Exception:
-                                    sf_step = 0.0
-
-                                wandb_log.update(
-                                    {
-                                        "train/mlm_loss": mlm_step,
-                                        "train/view_contrastive_loss": view_step,
-                                        "train/same_file_contrastive_loss": sf_step,
-                                    }
+                            for spec in self.metric_specs:
+                                log_entry[spec.key] = float(
+                                    avg_metrics.get(spec.key, 0.0)
                                 )
 
-                                # Effective weights (with ramp applied) for transparency
-                                if (
-                                    self.config.contrastive_ramp_steps
-                                    and self.config.contrastive_ramp_steps > 0
-                                ):
-                                    ramp = min(
-                                        1.0,
-                                        self.global_step
-                                        / float(self.config.contrastive_ramp_steps),
-                                    )
-                                else:
-                                    ramp = 1.0
+                            self.training_history.append(log_entry)
 
-                                eff_view_w = self.config.view_contrastive_weight * ramp
-                                eff_sf_w = (
-                                    self.config.same_file_contrastive_weight * ramp
-                                )
-
-                                wandb_log.update(
-                                    {
-                                        "train/mlm_weight": float(
-                                            self.config.mlm_weight
-                                        ),
-                                        "train/view_contrastive_weight": float(
-                                            eff_view_w
-                                        ),
-                                        "train/same_file_contrastive_weight": float(
-                                            eff_sf_w
-                                        ),
-                                    }
-                                )
-
-                                wandb.log(wandb_log, step=self.global_step)
-
-                            # Limit history size to prevent memory issues
                             if len(self.training_history) > 10000:
                                 self.training_history = self.training_history[-5000:]
 
-                            # Track in metrics object if available
                             if self.metrics:
-                                self.metrics.log(
-                                    {
-                                        "mlm_loss": float(current_loss),
-                                        "learning_rate": float(current_lr),
-                                        "gradient_norm": float(grad_norm)
-                                        if self.accelerator.sync_gradients
-                                        else 0.0,
-                                    },
-                                    self.global_step,
-                                )
+                                metrics_payload = {
+                                    "learning_rate": float(current_lr),
+                                    "gradient_norm": float(grad_norm),
+                                }
+                                if "mlm_loss" in step_metrics:
+                                    metrics_payload["mlm_loss"] = float(
+                                        step_metrics["mlm_loss"]
+                                    )
+                                self.metrics.log(metrics_payload, self.global_step)
 
-                        # Evaluation
+                            if self.wandb_run and self.accelerator.is_main_process:
+                                wandb_log = {
+                                    "train/loss": float(avg_loss),
+                                    "train/learning_rate": float(current_lr),
+                                    "train/epoch": epoch,
+                                    "train/global_step": self.global_step,
+                                    "train/gradient_norm": float(grad_norm),
+                                }
+                                for spec in self.metric_specs:
+                                    wandb_log[spec.wandb_name] = float(
+                                        step_metrics.get(spec.key, 0.0)
+                                    )
+
+                                    if step_result.extras:
+                                        for key, value in step_result.extras.items():
+                                            wandb_log[f"train/{key}"] = float(value)
+
+                                wandb.log(wandb_log, step=self.global_step)
+
                         if (
                             self.val_dataloader
                             and self.global_step % self.config.eval_steps == 0
                         ):
                             val_loss = self.evaluate()
                             self.model.train()
-
-                            # Check for improvement
                             improved = val_loss < self.best_val_loss
                             if improved:
                                 self.best_val_loss = val_loss
@@ -977,17 +925,23 @@ class Trainer:
                                 f"{'(improved)' if improved else ''}[/yellow]"
                             )
 
-                            # Log validation loss to WandB
-                            if self.wandb_run and self.accelerator.is_main_process:
-                                wandb.log(
-                                    {"eval/loss": val_loss}, step=self.global_step
+                            if self.jsonl_logger and self.accelerator.is_main_process:
+                                self._log_jsonl_event(
+                                    "evaluation",
+                                    {
+                                        "val_loss": float(val_loss),
+                                        "improved": bool(improved),
+                                    },
                                 )
 
-                            # Early stopping check
-                            if self.early_stopping:
-                                metrics_dict = {"mlm_loss": val_loss}
+                            if self.wandb_run and self.accelerator.is_main_process:
+                                wandb.log(
+                                    {"eval/loss": float(val_loss)},
+                                    step=self.global_step,
+                                )
 
-                                # Add embedding quality if monitored
+                            if self.early_stopping:
+                                metrics_dict = {"mlm_loss": float(val_loss)}
                                 if (
                                     self.embedding_monitor
                                     and self.config.monitor_embedding_quality
@@ -1007,23 +961,39 @@ class Trainer:
                                     )
                                     break
 
-                        # Run periodic assessment
                         if (
                             self.config.run_assessment
                             and self.global_step % self.config.assessment_steps == 0
                             and self.global_step > 0
                         ):
                             assessment_results = self.run_assessment()
-
-                            # Clear GPU cache after assessment to prevent OOM
+                            assessment_log = {
+                                key: float(value)
+                                for key, value in assessment_results.items()
+                            }
+                            self.assessment_history.append(
+                                {"step": self.global_step, **assessment_log}
+                            )
+                            if self.jsonl_logger and self.accelerator.is_main_process:
+                                self._log_jsonl_event(
+                                    "assessment",
+                                    {
+                                        "assessment": assessment_log,
+                                    },
+                                )
                             if torch.cuda.is_available():
                                 torch.cuda.empty_cache()
-
-                            # Log assessment results to WandB
                             if self.wandb_run and self.accelerator.is_main_process:
-                                wandb.log(assessment_results, step=self.global_step)
+                                wandb_payload = {
+                                    **assessment_log,
+                                    "assessment/step": float(self.global_step),
+                                }
+                                wandb.log(wandb_payload, step=self.global_step)
+                                self.wandb_run.summary.update(assessment_log)
+                                self.wandb_run.summary["assessment/last_step"] = float(
+                                    self.global_step
+                                )
 
-                        # Save checkpoint
                         if (
                             not self.config.save_best_only
                             and self.global_step % self.config.save_steps == 0
@@ -1031,45 +1001,33 @@ class Trainer:
                         ):
                             self.save_checkpoint()
 
-                        # Periodically clear GPU cache to prevent memory fragmentation
                         if self.global_step % 100 == 0 and torch.cuda.is_available():
                             torch.cuda.empty_cache()
 
-            # End of epoch
-            avg_epoch_loss = epoch_loss / epoch_steps if epoch_steps > 0 else 0
-            console.print(
-                f"[green]Epoch {epoch} completed - "
-                f"Average Loss: {avg_epoch_loss:.4f}[/green]"
-            )
+                avg_epoch_loss = (
+                    epoch_loss_sum / epoch_steps if epoch_steps > 0 else 0.0
+                )
+                console.print(
+                    f"[green]Epoch {epoch} complete - avg loss: {avg_epoch_loss:.4f}[/green]"
+                )
 
-        # Save final model
+            if should_stop:
+                break
+
         self.save_checkpoint(is_final=True)
         self.save_training_history()
 
-        # Save metrics if available
-        if self.metrics:
-            metrics_path = self.output_dir / "training_metrics.json"
-            self.metrics.save(metrics_path)
-            console.print(f"[dim]Saved metrics to {metrics_path}[/dim]")
+        if self.jsonl_logger and self.accelerator.is_main_process:
+            self._log_jsonl_event(
+                "training_complete",
+                {
+                    "final_step": int(self.global_step),
+                    "best_val_loss": float(self.best_val_loss),
+                },
+            )
+            self.jsonl_logger.close()
+            self.jsonl_logger = None
 
-        # Run final assessment
-        if self.config.run_assessment:
-            console.print("[yellow]Running final assessment...[/yellow]")
-            final_assessment = self.run_assessment()
-
-            # Save assessment results
-            assessment_path = self.output_dir / "final_assessment.json"
-            with open(assessment_path, "w") as f:
-                json.dump(final_assessment, f, indent=2)
-            console.print(f"[dim]Saved final assessment to {assessment_path}[/dim]")
-
-            # Log to WandB
-            if self.wandb_run and self.accelerator.is_main_process:
-                # Add "final/" prefix to distinguish from periodic assessments
-                final_metrics = {f"final/{k}": v for k, v in final_assessment.items()}
-                wandb.log(final_metrics, step=self.global_step)
-
-        # Finish WandB run
         if self.wandb_run:
             wandb.finish()
 
@@ -1187,6 +1145,16 @@ class Trainer:
 
         console.print(f"[dim]Saved checkpoint to {checkpoint_dir}[/dim]")
 
+        if self.jsonl_logger and self.accelerator.is_main_process:
+            self._log_jsonl_event(
+                "checkpoint_saved",
+                {
+                    "path": str(checkpoint_dir),
+                    "is_best": bool(is_best),
+                    "is_final": bool(is_final),
+                },
+            )
+
         # Clean up old checkpoints if limit is set
         if self.config.save_total_limit and not is_best and not is_final:
             self._cleanup_checkpoints()
@@ -1260,6 +1228,16 @@ class Trainer:
                 f"[dim]  Best validation loss: {self.best_val_loss:.4f}[/dim]"
             )
 
+            if self.jsonl_logger and self.accelerator.is_main_process:
+                self._log_jsonl_event(
+                    "checkpoint_loaded",
+                    {
+                        "path": str(checkpoint_path),
+                        "restored_step": int(self.global_step),
+                        "best_val_loss": float(self.best_val_loss),
+                    },
+                )
+
             # Load training history if it exists
             history_path = checkpoint_path.parent / "training_history.json"
             if history_path.exists():
@@ -1270,10 +1248,23 @@ class Trainer:
                 console.print(
                     f"[dim]  Training history loaded: {len(self.training_history)} entries[/dim]"
                 )
+
+            assessment_history_path = checkpoint_path.parent / "assessment_history.json"
+            if assessment_history_path.exists():
+                with open(assessment_history_path) as f:
+                    self.assessment_history = json.load(f)
+                console.print(
+                    f"[dim]  Assessment history loaded: {len(self.assessment_history)} entries[/dim]"
+                )
         else:
             console.print(
                 f"[yellow]⚠ No training state found at {checkpoint_path}, starting fresh[/yellow]"
             )
+            if self.jsonl_logger and self.accelerator.is_main_process:
+                self._log_jsonl_event(
+                    "checkpoint_missing",
+                    {"path": str(checkpoint_path)},
+                )
 
     def _init_wandb(self) -> None:
         """Initialize WandB run with configuration."""
@@ -1461,3 +1452,506 @@ class Trainer:
             json.dump(self.training_history, f, indent=2)
 
         console.print(f"[dim]Saved training history to {history_path}[/dim]")
+
+        assessment_path = self.output_dir / "assessment_history.json"
+        with open(assessment_path, "w") as f:
+            json.dump(self.assessment_history, f, indent=2)
+
+        console.print(f"[dim]Saved assessment history to {assessment_path}[/dim]")
+
+    # ------------------------------------------------------------------
+    # JSONL diagnostics helpers
+
+    def _log_jsonl_event(
+        self,
+        event: str,
+        payload: dict[str, Any],
+        *,
+        include_step: bool = True,
+    ) -> None:
+        if not self.jsonl_logger or not self.accelerator.is_main_process:
+            return
+
+        record: dict[str, Any] = {
+            "event": event,
+            "timestamp": datetime.utcnow().isoformat(timespec="milliseconds"),
+        }
+        if include_step:
+            record["step"] = int(self.global_step)
+        record.update(payload)
+        self.jsonl_logger.log(record)
+
+    def _infer_optimizer_step(self) -> int | None:
+        try:
+            for group in self.optimizer.param_groups:
+                for param in group.get("params", []):
+                    state = self.optimizer.state.get(param)
+                    if state and "step" in state:
+                        return int(state["step"])
+        except Exception:
+            return None
+        return None
+
+    def _collect_optimizer_snapshot(self) -> dict[str, Any]:
+        snapshot: dict[str, Any] = {
+            "type": self.optimizer.__class__.__name__,
+            "param_groups": [],
+        }
+        for idx, group in enumerate(self.optimizer.param_groups):
+            group_info: dict[str, Any] = {
+                "index": idx,
+                "lr": float(group.get("lr", 0.0)),
+                "weight_decay": float(group.get("weight_decay", 0.0)),
+            }
+            betas = group.get("betas")
+            if betas:
+                group_info["beta1"] = float(betas[0])
+                group_info["beta2"] = float(betas[1])
+            if "eps" in group:
+                group_info["epsilon"] = float(group["eps"])
+            if "initial_lr" in group:
+                group_info["initial_lr"] = float(group["initial_lr"])
+            snapshot["param_groups"].append(group_info)
+        optimizer_step = self._infer_optimizer_step()
+        if optimizer_step is not None:
+            snapshot["step"] = optimizer_step
+        return snapshot
+
+    def _collect_batch_stats(self, batch: dict[str, torch.Tensor]) -> dict[str, Any]:
+        stats: dict[str, Any] = {}
+        try:
+            input_ids = batch["input_ids"].detach()
+            attention_mask = batch["attention_mask"].detach()
+        except KeyError:
+            return stats
+
+        if input_ids.device.type != "cpu":
+            input_ids = input_ids.to("cpu", non_blocking=True)
+        if attention_mask.device.type != "cpu":
+            attention_mask = attention_mask.to("cpu", non_blocking=True)
+
+        # Normalize shapes for MLM vs contrastive batches.
+        if input_ids.dim() == 3:
+            batch_size, views, seq_len = input_ids.shape
+            reshaped_inputs = input_ids.view(batch_size * views, seq_len)
+            reshaped_mask = attention_mask.view(batch_size * views, seq_len)
+        else:
+            reshaped_inputs = input_ids
+            reshaped_mask = attention_mask
+            batch_size, seq_len = input_ids.shape
+            views = 1
+
+        active_tokens = int(reshaped_mask.sum().item())
+        total_tokens = reshaped_mask.numel()
+        pad_tokens = total_tokens - active_tokens
+        empty_sequences = int((reshaped_mask.sum(dim=-1) == 0).sum().item())
+
+        stats.update(
+            {
+                "batch_size": int(batch_size),
+                "views": int(views),
+                "sequence_length": int(seq_len),
+                "active_tokens": active_tokens,
+                "pad_tokens": int(pad_tokens),
+                "pad_ratio": float(pad_tokens / total_tokens) if total_tokens else 0.0,
+                "empty_sequences": empty_sequences,
+            }
+        )
+
+        if "labels" in batch:
+            labels = batch["labels"].detach()
+            if labels.device.type != "cpu":
+                labels = labels.to("cpu", non_blocking=True)
+            effective_labels = labels.view(reshaped_inputs.shape)
+            mask_tokens = int((effective_labels != -100).sum().item())
+            stats["masked_tokens"] = mask_tokens
+            stats["mask_ratio"] = (
+                float(mask_tokens / active_tokens) if active_tokens else 0.0
+            )
+
+        token_selector = reshaped_mask.bool()
+        valid_tokens = reshaped_inputs[token_selector]
+        if valid_tokens.numel() > 0:
+            valid_tokens_float = valid_tokens.float()
+            stats["token_mean"] = float(valid_tokens_float.mean().item())
+            stats["token_std"] = float(valid_tokens_float.std(unbiased=False).item())
+            stats["token_min"] = int(valid_tokens.min().item())
+            stats["token_max"] = int(valid_tokens.max().item())
+            stats["unique_tokens"] = int(torch.unique(valid_tokens).numel())
+        else:
+            stats["token_mean"] = 0.0
+            stats["token_std"] = 0.0
+            stats["token_min"] = 0
+            stats["token_max"] = 0
+            stats["unique_tokens"] = 0
+
+        return stats
+
+    def _collect_gradient_stats(self) -> dict[str, Any]:
+        if not self.accelerator.sync_gradients:
+            return {}
+
+        stats: dict[str, Any] = {"groups": []}
+        total_abs = 0.0
+        total_sq = 0.0
+        total_params = 0
+        max_abs = 0.0
+
+        with torch.no_grad():
+            for idx, group in enumerate(self.optimizer.param_groups):
+                group_abs = 0.0
+                group_sq = 0.0
+                group_params = 0
+                group_max = 0.0
+                for param in group.get("params", []):
+                    grad = param.grad
+                    if grad is None:
+                        continue
+                    grad_data = grad.detach()
+                    grad_float = grad_data.float()
+                    group_abs += float(grad_float.abs().sum().item())
+                    group_sq += float(torch.sum(grad_float * grad_float).item())
+                    group_params += grad_data.numel()
+                    param_max = float(grad_float.abs().max().item())
+                    if param_max > group_max:
+                        group_max = param_max
+                if group_params > 0:
+                    stats["groups"].append(
+                        {
+                            "index": idx,
+                            "mean_abs": group_abs / group_params,
+                            "rms": math.sqrt(group_sq / group_params),
+                            "max_abs": group_max,
+                            "param_count": int(group_params),
+                        }
+                    )
+                    total_abs += group_abs
+                    total_sq += group_sq
+                    total_params += group_params
+                    if group_max > max_abs:
+                        max_abs = group_max
+
+        if total_params > 0:
+            stats["global"] = {
+                "mean_abs": total_abs / total_params,
+                "rms": math.sqrt(total_sq / total_params),
+                "max_abs": max_abs,
+                "param_count": int(total_params),
+            }
+
+        return stats if stats.get("groups") else {}
+
+    def _log_jsonl_step(
+        self,
+        *,
+        epoch: int,
+        epoch_step: int,
+        steps_this_epoch: int,
+        step_loss: float,
+        avg_loss: float,
+        grad_norm: float,
+        adaptive_clip_threshold: float,
+        current_lr: float,
+        step_metrics: dict[str, float],
+        batch_stats: dict[str, Any] | None,
+        grad_stats: dict[str, Any] | None,
+        extras: dict[str, float] | None,
+    ) -> None:
+        if not self.jsonl_logger or not self.accelerator.is_main_process:
+            return
+
+        now = time.time()
+        step_time = None
+        samples_per_sec = None
+        if self._last_jsonl_log_time is not None:
+            step_time = now - self._last_jsonl_log_time
+            effective_batch = (
+                self.config.batch_size * self.config.gradient_accumulation_steps
+            )
+            if step_time and step_time > 0:
+                samples_per_sec = effective_batch / step_time
+        self._last_jsonl_log_time = now
+
+        optimizer_snapshot = self._collect_optimizer_snapshot()
+        payload: dict[str, Any] = {
+            "epoch": int(epoch),
+            "epoch_step": int(epoch_step),
+            "steps_this_epoch": int(steps_this_epoch),
+            "progress": float(self.global_step / self.total_steps)
+            if self.total_steps
+            else None,
+            "loss": {
+                "current": float(step_loss),
+                "running_avg": float(avg_loss),
+            },
+            "metrics": step_metrics,
+            "optimizer": {
+                **optimizer_snapshot,
+                "learning_rate": float(current_lr),
+                "grad_norm": float(grad_norm),
+                "adaptive_clip_threshold": float(adaptive_clip_threshold),
+                "max_grad_norm": float(self.config.max_grad_norm),
+                "use_adaptive_grad_clip": bool(self.config.use_adaptive_grad_clip),
+            },
+        }
+
+        if grad_stats:
+            payload["gradients"] = grad_stats
+        if batch_stats:
+            payload["batch"] = batch_stats
+        if extras:
+            payload["extras"] = extras
+        if step_time is not None:
+            payload["timing"] = {
+                "step_time_sec": step_time,
+                "samples_per_sec": samples_per_sec,
+            }
+
+        self._log_jsonl_event("train_step", payload)
+
+
+
+class MLMTrainer(BaseTrainer):
+    """Trainer for the MLM pretraining stage."""
+
+    def __init__(
+        self,
+        model: nn.Module,
+        tokenizer: BinaryTokenizer,
+        train_dataloader: DataLoader,
+        config: TrainerConfig,
+        model_config: BinaryEmbeddingConfig | None = None,
+        val_dataloader: DataLoader | None = None,
+        resume_from_checkpoint: Path | None = None,
+    ) -> None:
+        metric_specs = (
+            TrainingMetricSpec(
+                key="mlm_loss",
+                field="mlm",
+                label="MLM",
+                wandb_name="train/mlm_loss",
+            ),
+        )
+        super().__init__(
+            model=model,
+            tokenizer=tokenizer,
+            train_dataloader=train_dataloader,
+            config=config,
+            stage="mlm",
+            metric_specs=metric_specs,
+            model_config=model_config,
+            val_dataloader=val_dataloader,
+            resume_from_checkpoint=resume_from_checkpoint,
+        )
+
+    def _forward_step(self, batch: dict[str, torch.Tensor]) -> StepResult:
+        input_ids = batch["input_ids"]
+        attention_mask = batch["attention_mask"]
+        labels = batch["labels"]
+
+        with self.accelerator.autocast():
+            if hasattr(self.model, "roberta"):
+                backbone = self.model.roberta
+            elif hasattr(self.model, "bert"):
+                backbone = self.model.bert
+            else:
+                backbone = None
+
+            if hasattr(self.model, "lm_head"):
+                mlm_head = self.model.lm_head
+            elif hasattr(self.model, "cls"):
+                mlm_head = self.model.cls
+            else:
+                mlm_head = None
+
+            if backbone is not None and mlm_head is not None:
+                base_out = backbone(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    return_dict=True,
+                )
+                last_hidden = base_out.last_hidden_state
+                prediction_scores = mlm_head(last_hidden)
+                vocab_size = prediction_scores.size(-1)
+                loss = F.cross_entropy(
+                    prediction_scores.view(-1, vocab_size),
+                    labels.view(-1),
+                    ignore_index=-100,
+                )
+            else:
+                outputs = self.model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    labels=labels,
+                    return_dict=True,
+                )
+                loss = outputs.loss
+
+        metrics = {"mlm_loss": loss.detach().float()}
+        extras = {"mlm_weight": float(self.config.mlm_weight)}
+        return StepResult(loss=loss, metrics=metrics, extras=extras)
+
+
+class ContrastiveTrainer(BaseTrainer):
+    """Trainer for the contrastive fine-tuning stage."""
+
+    def __init__(
+        self,
+        model: nn.Module,
+        tokenizer: BinaryTokenizer,
+        train_dataloader: DataLoader,
+        config: TrainerConfig,
+        model_config: BinaryEmbeddingConfig | None = None,
+        val_dataloader: DataLoader | None = None,
+        resume_from_checkpoint: Path | None = None,
+    ) -> None:
+        metric_specs = (
+            TrainingMetricSpec(
+                key="mlm_loss",
+                field="mlm",
+                label="MLM",
+                wandb_name="train/mlm_loss",
+            ),
+            TrainingMetricSpec(
+                key="view_loss",
+                field="vctr",
+                label="VCtr",
+                wandb_name="train/view_contrastive_loss",
+            ),
+            TrainingMetricSpec(
+                key="same_file_loss",
+                field="sfctr",
+                label="SFCtr",
+                wandb_name="train/same_file_contrastive_loss",
+            ),
+        )
+        super().__init__(
+            model=model,
+            tokenizer=tokenizer,
+            train_dataloader=train_dataloader,
+            config=config,
+            stage="contrastive",
+            metric_specs=metric_specs,
+            model_config=model_config,
+            val_dataloader=val_dataloader,
+            resume_from_checkpoint=resume_from_checkpoint,
+        )
+
+    def _forward_step(self, batch: dict[str, torch.Tensor]) -> StepResult:
+        if "input_ids" not in batch or batch["input_ids"].dim() != 3:
+            raise ValueError("ContrastiveTrainer expects batches with shape [B, 2, L]")
+
+        input_ids = batch["input_ids"]
+        attention_mask = batch["attention_mask"]
+        labels = batch["labels"]
+        pair_types = batch.get("pair_types")
+        if pair_types is None:
+            raise ValueError("Contrastive batches must include 'pair_types'")
+
+        bsz, views, seqlen = input_ids.shape
+        flat_input_ids = input_ids.view(bsz * views, seqlen)
+        flat_attention = attention_mask.view(bsz * views, seqlen)
+        flat_labels = labels.view(bsz * views, seqlen)
+
+        with self.accelerator.autocast():
+            if hasattr(self.model, "roberta"):
+                backbone = self.model.roberta
+            elif hasattr(self.model, "bert"):
+                backbone = self.model.bert
+            else:
+                backbone = None
+
+            if hasattr(self.model, "lm_head"):
+                mlm_head = self.model.lm_head
+            elif hasattr(self.model, "cls"):
+                mlm_head = self.model.cls
+            else:
+                mlm_head = None
+
+            if backbone is not None and mlm_head is not None:
+                base_out = backbone(
+                    input_ids=flat_input_ids,
+                    attention_mask=flat_attention,
+                    return_dict=True,
+                )
+                last_hidden = base_out.last_hidden_state
+                prediction_scores = mlm_head(last_hidden)
+                vocab_size = prediction_scores.size(-1)
+                mlm_loss = F.cross_entropy(
+                    prediction_scores.view(-1, vocab_size),
+                    flat_labels.view(-1),
+                    ignore_index=-100,
+                )
+            else:
+                outputs = self.model(
+                    input_ids=flat_input_ids,
+                    attention_mask=flat_attention,
+                    labels=flat_labels,
+                    return_dict=True,
+                )
+                mlm_loss = outputs.loss
+                if hasattr(outputs, "last_hidden_state"):
+                    last_hidden = outputs.last_hidden_state
+                else:
+                    outputs_h = self.model(
+                        input_ids=flat_input_ids,
+                        attention_mask=flat_attention,
+                        return_dict=True,
+                        output_hidden_states=True,
+                    )
+                    last_hidden = outputs_h.hidden_states[-1]
+
+        embeddings = pool_embeddings(
+            last_hidden,
+            flat_attention,
+            method=self.config.pooling,
+        )
+        embeddings = embeddings.view(bsz, views, -1)
+
+        pair_types = pair_types.to(embeddings.device)
+        dup_a, dup_b, sf_a, sf_b = split_by_pair_type(embeddings, pair_types)
+
+        view_loss = (
+            info_nce_pairwise(dup_a, dup_b, self.config.contrastive_temperature)
+            if dup_a.size(0) > 0
+            else mlm_loss.new_tensor(0.0)
+        )
+        same_file_loss = (
+            info_nce_pairwise(sf_a, sf_b, self.config.contrastive_temperature)
+            if sf_a.size(0) > 0
+            else mlm_loss.new_tensor(0.0)
+        )
+
+        if (
+            self.config.contrastive_ramp_steps
+            and self.config.contrastive_ramp_steps > 0
+        ):
+            ramp = min(
+                1.0,
+                self.global_step / float(max(1, self.config.contrastive_ramp_steps)),
+            )
+        else:
+            ramp = 1.0
+
+        mlm_weight = float(self.config.mlm_weight)
+        view_weight = float(self.config.view_contrastive_weight * ramp)
+        same_file_weight = float(self.config.same_file_contrastive_weight * ramp)
+
+        total_loss = (
+            mlm_weight * mlm_loss
+            + view_weight * view_loss
+            + same_file_weight * same_file_loss
+        )
+
+        metrics = {
+            "mlm_loss": mlm_loss.detach().float(),
+            "view_loss": view_loss.detach().float(),
+            "same_file_loss": same_file_loss.detach().float(),
+        }
+        extras = {
+            "mlm_weight": mlm_weight,
+            "view_weight": view_weight,
+            "same_file_weight": same_file_weight,
+        }
+
+        return StepResult(loss=total_loss, metrics=metrics, extras=extras)

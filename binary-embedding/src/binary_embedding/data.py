@@ -318,7 +318,7 @@ class StreamingBinaryDataset(IterableDataset):
                 continue
 
     def __iter__(self):
-        """Iterate over chunks with background loading."""
+        """Iterate over chunks with background loading and shuffling."""
         if not self.file_paths:
             return
 
@@ -360,21 +360,49 @@ class StreamingBinaryDataset(IterableDataset):
         producer = threading.Thread(target=file_producer, daemon=True)
         producer.start()
 
-        # Yield chunks as they become available
+        # Shuffle buffer for chunk-level randomization
+        # This breaks the sequential-within-file pattern
+        shuffle_buffer = []
+        shuffle_buffer_size = min(self.buffer_size, 5000)  # Cap at 5k chunks for memory
+
+        # Yield chunks with shuffling
         empty_count = 0
         while True:
-            try:
-                chunk = chunk_queue.get(timeout=0.1)
-                yield chunk
-                empty_count = 0
-            except queue.Empty:
-                empty_count += 1
-                # Stop if no data for 5 seconds and not cycling
-                if not self.cycle and empty_count > 50:
-                    break
-                # For cycling mode, wait longer before giving up
-                if self.cycle and empty_count > 100:
-                    break
+            # Fill shuffle buffer
+            while len(shuffle_buffer) < shuffle_buffer_size:
+                try:
+                    chunk = chunk_queue.get(timeout=0.1)
+                    shuffle_buffer.append(chunk)
+                    empty_count = 0
+                except queue.Empty:
+                    empty_count += 1
+                    # If buffer has some data and queue is empty, break to yield what we have
+                    if len(shuffle_buffer) > 0 and empty_count > 10:
+                        break
+                    # Stop if no data for 5 seconds and not cycling
+                    if not self.cycle and empty_count > 50:
+                        break
+                    # For cycling mode, wait longer before giving up
+                    if self.cycle and empty_count > 100:
+                        break
+
+            # No more data and buffer empty
+            if len(shuffle_buffer) == 0:
+                break
+
+            # Shuffle the buffer to break sequential chunk ordering
+            if self.shuffle:
+                random.shuffle(shuffle_buffer)
+
+            # Yield chunks from shuffled buffer
+            # Keep half the buffer to maintain continuous mixing
+            yield_count = max(1, len(shuffle_buffer) // 2)
+            for _ in range(yield_count):
+                if shuffle_buffer:
+                    yield shuffle_buffer.pop()
+
+            # Reset empty count after successful yield
+            empty_count = 0
 
 
 class MLMDataCollator:

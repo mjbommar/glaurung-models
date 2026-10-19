@@ -1,0 +1,6 @@
+# model weights, training runs and data stay out of git (published models: HF mjbommar/glaurung-*)
+.claude/
+archive/v1/models/
+archive/v1/data/
+binary-embedding/models/
+binary-embedding/archive/
